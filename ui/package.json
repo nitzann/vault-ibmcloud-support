@@ -28,7 +28,9 @@
     "fmt:hbs": "prettier --config .prettierrc.js --write '**/*.hbs'",
     "fmt:styles": "prettier --write app/styles/**/*.*",
     "generate:form-config": "node --no-warnings scripts/generate-form-config.js",
+    "generate:terraform-mapping": "node scripts/generate-terraform-mapping.js",
     "start": "VAULT_ADDR=http://127.0.0.1:8200; pnpm build:jsondiffpatch && ember server --proxy=$VAULT_ADDR",
+    "start:dev": "VAULT_BRANCH=$(git rev-parse --abbrev-ref HEAD) VAULT_COMMIT=$(git rev-parse --short HEAD) ember server --proxy=${VAULT_ADDR:-http://127.0.0.1:8200}",
     "start2": "pnpm build:jsondiffpatch && ember server --proxy=http://127.0.0.1:8202 --port=4202",
     "start:chroot": "ember server --proxy=http://127.0.0.1:8300 --port=4300",
     "lint": "concurrently --kill-others-on-fail -P -c \"auto\" -n lint:js,lint:hbs,lint:types \"pnpm:lint:js:quiet\" \"pnpm:lint:hbs:quiet\" \"pnpm:lint:types\"",
@@ -54,7 +56,6 @@
     "@babel/preset-env": "~7.29.5",
     "@babel/preset-typescript": "~7.27.1",
     "@codemirror/view": "^6.43.0",
-    "@docfy/ember": "~0.8.5",
     "@ember/legacy-built-in-components": "~0.4.2",
     "@ember/optional-features": "~2.2.0",
     "@ember/render-modifiers": "~3.0.0",
@@ -93,9 +94,9 @@
     "d3-shape": "~3.2.0",
     "date-fns": "~2.30.0",
     "date-fns-tz": "~1.3.8",
-    "dompurify": "~3.3.3",
+    "dompurify": "~3.4.11",
     "ember-a11y-testing": "~7.1.3",
-    "ember-basic-dropdown": "~8.7.0",
+    "ember-basic-dropdown": "~8.9.0",
     "ember-cli": "~5.8.1",
     "ember-cli-babel": "~8.2.0",
     "ember-cli-clean-css": "~3.0.0",
@@ -171,18 +172,14 @@
   "pnpm": {
     "overrides": {
       "@babel/runtime": "7.27.0",
-      "@xmldom/xmldom": "0.9.10",
       "ansi-html": "0.0.8",
-      "async": "2.6.4",
       "braces": "3.0.3",
-      "json5": "1.0.2",
       "kind-of": "6.0.3",
-      "lodash": "4.18.0",
-      "lodash-es": "4.18.0",
       "markdown-it": "14.1.1",
       "micromatch": "4.0.8",
-      "qs": "6.14.1",
-      "rollup": "2.80.0"
+      "rollup": "2.80.0",
+      "tmp": "0.2.7",
+      "ws": "8.21.0"
     }
   },
   "engines": {
@@ -219,17 +216,19 @@
     "@babel/core": "7.26.10",
     "@babel/eslint-parser": "^7.29.7",
     "@carbon/charts": "^1.27.11",
-    "@hashicorp-internal/vault-reporting": "file:vault-reporting/0.21.0.tgz",
-    "@hashicorp/design-system-components": "4.24.1",
+    "@hashicorp/design-system-components": "5.2.0",
     "@hashicorp/design-system-tokens": "3.0.0",
     "@hashicorp/vault-client-typescript": "github:hashicorp/vault-client-typescript",
+    "@segment/analytics-next": "^1.84.1",
     "ember-auto-import": "2.10.0",
     "handlebars": "4.7.9",
+    "js-yaml": "^5.2.1",
     "posthog-js": "1.236.1",
     "uuid": "9.0.1"
   },
   "packageManager": "pnpm@10.22.0+sha512.bf049efe995b28f527fd2b41ae0474ce29186f7edcb3bf545087bd61fbbebb2bf75362d1307fda09c2d288e1e499787ac12d4fcb617a974718a6051f2eee741c",
   "scarfSettings": {
+    "allowTopLevel": false,
     "defaultOptIn": false,
     "enabled": false,
     "skipTraversal": true

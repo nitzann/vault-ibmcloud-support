@@ -11,6 +11,7 @@ import { validate } from 'vault/utils/forms/validate';
 import { service } from '@ember/service';
 import { task } from 'ember-concurrency';
 import routerLookup from 'core/utils/router-lookup';
+import { sysPoliciesAclNameMapping } from 'vault/utils/terraform-mappings/sys-policies-acl-name-mapping';
 
 import type { HTMLElementEvent } from 'vault/forms';
 import type { PolicyData } from './builder';
@@ -40,7 +41,7 @@ export default class CodeGeneratorPolicyFlyout extends Component<Args> {
       {
         validator: ({ stanzas }) =>
           stanzas.length > 0 && stanzas.every((stanza: PolicyStanza) => stanza.isValid),
-        message: 'Invalid policy content.',
+        message: 'Path is required for each rule.',
       },
     ],
   };
@@ -80,6 +81,12 @@ export default class CodeGeneratorPolicyFlyout extends Component<Args> {
     const policyName = this.policyName || '<policy name>';
     const policy = formatStanzas(this.stanzas);
     return policySnippetArgs(policyName, policy);
+  }
+
+  get terraformSnippet() {
+    const policyName = this.policyName;
+    const policies = formatStanzas(this.stanzas);
+    return sysPoliciesAclNameMapping({ name: policyName, policy: policies });
   }
 
   @task

@@ -89,8 +89,44 @@ variable "vault_install_dir" {
   default     = null
 }
 
+variable "vault_ibm_license_edition" {
+  type        = string
+  description = "The expected Vault edition in use in the IBM PAO license"
+  default     = null
+}
+
 variable "test_env_vars" {
   type        = map(string)
   description = "Additional environment variables to pass to the test"
   default     = {}
+}
+
+variable "verify_expected_state" {
+  type        = string
+  description = "Default EXPECTED_STATE for isolated/verify tests (0 or 1). Used when test_env_vars does not already set EXPECTED_STATE."
+  default     = "1"
+}
+
+variable "verify_timeout_seconds" {
+  type        = string
+  description = "Default TIMEOUT_SECONDS for isolated/verify tests. Used when test_env_vars does not already set TIMEOUT_SECONDS."
+  default     = "180"
+}
+
+variable "verify_retry_interval" {
+  type        = string
+  description = "Default RETRY_INTERVAL for isolated/verify tests. Used when test_env_vars does not already set RETRY_INTERVAL."
+  default     = "5"
+}
+
+variable "verify_default_lcq" {
+  type        = string
+  description = "Expected DEFAULT_LCQ (max_leases) value for TestDefaultLCQ in isolated/verify. Empty string causes the test to skip (upgrading from < 1.16.0). Mirrors vault_autopilot_default_max_leases in vault_verify_default_lcq module."
+  default     = ""
+}
+
+variable "enable_testonly_tests" {
+  type        = bool
+  description = "Enable tests that require the 'testonly' build tag (e.g., verify tests). Set to true for docker environments to run verify tests."
+  default     = null
 }

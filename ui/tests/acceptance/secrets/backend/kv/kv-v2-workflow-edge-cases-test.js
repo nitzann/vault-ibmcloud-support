@@ -279,8 +279,8 @@ module('Acceptance | kv-v2 workflow | edge cases', function (hooks) {
       await visit(`/vault`);
       await selectChoose(GENERAL.superSelect('secrets-engines'), backend);
       await selectChoose(GENERAL.superSelect('actions'), 'Find KV secrets');
-      await typeIn(GENERAL.kvSuggestion.input, `${root}/`);
-      await click(GENERAL.kvSuggestion.input);
+      await typeIn(GENERAL.suggestion.input('kv'), `${root}/`);
+      await click(GENERAL.suggestion.input('kv'));
       assert
         .dom(GENERAL.searchSelect.options)
         .hasText(`${subdirectory}/`)
@@ -402,8 +402,10 @@ module('Acceptance | kv-v2 workflow | edge cases', function (hooks) {
 
     // Details view
     await click(PAGE.secretTab('Secret'));
-    assert.dom(GENERAL.toggleInput('json')).isNotDisabled('JSON toggle is not disabled');
-    assert.dom(GENERAL.toggleInput('json')).isChecked("JSON toggle is checked 'on'");
+    assert.dom(GENERAL.button('json')).exists('JSON view toggle renders on details view');
+    assert.dom(GENERAL.button('yaml')).exists('YAML view toggle renders on details view');
+
+    assert.dom(GENERAL.button('json')).hasClass('hds-button--color-primary');
 
     assert
       .dom(GENERAL.codeBlock('secret-data'))

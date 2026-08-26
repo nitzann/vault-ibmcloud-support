@@ -7,11 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/golang/protobuf/ptypes"
 	"github.com/hashicorp/go-secure-stdlib/strutil"
 	"github.com/hashicorp/vault/helper/identity"
+	"github.com/hashicorp/vault/helper/jwt"
 	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/helper/storagepacker"
 	"github.com/hashicorp/vault/sdk/framework"
@@ -126,8 +128,27 @@ This field is deprecated, use canonical_id.`,
 				OperationSuffix: "aliases-by-id",
 			},
 
-			Callbacks: map[logical.Operation]framework.OperationFunc{
-				logical.ListOperation: i.pathAliasIDList(),
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.ListOperation: &framework.PathOperation{
+					Callback: i.pathAliasIDList(),
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+							Fields: map[string]*framework.FieldSchema{
+								"keys": {
+									Type:        framework.TypeStringSlice,
+									Description: `A list of alias ids`,
+									Required:    true,
+								},
+								"key_info": {
+									Type:        framework.TypeMap,
+									Description: `Alias details keyed by the alias id`,
+									Required:    false,
+								},
+							},
+						}},
+					},
+				},
 			},
 
 			HelpSynopsis:    strings.TrimSpace(aliasHelp["alias-id-list"][0]),
@@ -157,7 +178,7 @@ func (i *IdentityStore) validateAliasMountAccessor(ctx context.Context, mountAcc
 		return nil, fmt.Errorf("failed to validate mount accessor %q due to internal configuration error", mountAccessor)
 	}
 
-	valid, err := i.syntheticAliasAccessorValidator.validateSyntheticAliasAccessor(ctx, mountAccessor)
+	valid, isLocal, err := i.syntheticAliasAccessorValidator.validateSyntheticAliasAccessor(ctx, mountAccessor)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +190,7 @@ func (i *IdentityStore) validateAliasMountAccessor(ctx context.Context, mountAcc
 	if err != nil {
 		return nil, err
 	}
-	return &MountEntry{NamespaceID: ns.ID}, nil
+	return &MountEntry{NamespaceID: ns.ID, Local: isLocal}, nil
 }
 
 func aliasFieldSchema() map[string]*framework.FieldSchema {
@@ -257,6 +278,9 @@ func (i *IdentityStore) handleAliasCreateUpdate() framework.OperationFunc {
 		// Get issuer if provided
 		issuer := d.Get("issuer").(string)
 
+		// normalize the issuer
+		issuer = jwt.NormalizeIssuer(issuer)
+
 		i.lock.Lock()
 		defer i.lock.Unlock()
 
@@ -315,20 +339,25 @@ func (i *IdentityStore) handleAliasCreateUpdate() framework.OperationFunc {
 			}
 		}
 
-		// If they didn't provide an ID or Mount Accessor, but provided an issuer, validate that the issuer has been
-		// registered. Return error if issuer has not been registered.
-		if mountAccessor == "" && issuer != "" {
-			// Generate synthetic Mount Accessor
-			syntheticAccessor, err := i.syntheticAliasAccessorValidator.generateSyntheticAliasAccessor(ctx, issuer)
-			if err != nil {
-				return logical.ErrorResponse(err.Error()), nil
-			}
-			mountAccessor = syntheticAccessor
+		if name == "" {
+			return logical.ErrorResponse("'name' must be provided"), nil
 		}
 
-		// If they didn't provide an ID, we must have both accessor and name provided
-		if mountAccessor == "" || name == "" {
-			return logical.ErrorResponse("'id' or 'mount_accessor' and 'name' must be provided"), nil
+		// Create synthetic alias accessor if necessary
+		if mountAccessor == "" {
+			// Only create synthetic alias accessor if issuer and external_id are both present
+			if issuer != "" && externalID != "" {
+				syntheticAccessor, _, err := i.syntheticAliasAccessorValidator.generateSyntheticAliasAccessor(ctx, issuer)
+				if err != nil {
+					return logical.ErrorResponse(err.Error()), nil
+				}
+				mountAccessor = syntheticAccessor
+				// locality is carried back through validateAliasMountAccessor
+				// below: it returns MountEntry.Local=true for local profiles,
+				// which flows into localMount and then handleAliasCreate.
+			} else {
+				return logical.ErrorResponse("'mount_accessor' or both 'issuer' and 'external_id' must be provided"), nil
+			}
 		}
 
 		mountEntry, err := i.validateAliasMountAccessor(ctx, mountAccessor)
@@ -482,6 +511,8 @@ func (i *IdentityStore) handleAliasCreate(ctx context.Context, canonicalID, name
 	}, nil
 }
 
+// handleAliasUpdate updates an alias with the provided fields. Returns (nil, nil) when no changes
+// are needed, which is the correct idempotent behavior for this operation.
 func (i *IdentityStore) handleAliasUpdate(ctx context.Context, canonicalID, name, mountAccessor, externalID, issuer string, alias *identity.Alias, customMetadata map[string]string) (*logical.Response, error) {
 	// Fast return if nothing to be updated
 	if name == alias.Name &&
@@ -704,7 +735,7 @@ func (i *IdentityStore) handleAliasReadCommon(ctx context.Context, alias *identi
 		return nil, err
 	}
 	if ns.ID != alias.NamespaceID {
-		return logical.ErrorResponse("alias and request are in different namespaces"), logical.ErrPermissionDenied
+		return nil, nil
 	}
 
 	respData := map[string]interface{}{}
@@ -769,7 +800,7 @@ func (i *IdentityStore) pathAliasIDDelete() framework.OperationFunc {
 			return nil, err
 		}
 		if ns.ID != alias.NamespaceID {
-			return logical.ErrorResponse("request and alias are in different namespaces"), logical.ErrPermissionDenied
+			return nil, nil
 		}
 
 		scimClientID := scimClientIDFromContext(ctx)

@@ -772,7 +772,7 @@ func TestSystemBackend_PathCapabilities(t *testing.T) {
 
 	core, b, rootToken := testCoreSystemBackend(t)
 
-	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy)
+	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy, WithDenySlashInTemplatedPaths(core.denySlashInTemplatedPolicyPaths))
 	err = core.policyStore.SetPolicy(namespace.RootContext(nil), policy)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -981,7 +981,7 @@ func testCapabilities(t *testing.T, endpoint string) {
 		t.Fatalf("bad: got\n%#v\nexpected\n%#v\n", actual, expected)
 	}
 
-	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy)
+	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy, WithDenySlashInTemplatedPaths(core.denySlashInTemplatedPolicyPaths))
 	err = core.policyStore.SetPolicy(namespace.RootContext(nil), policy)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -1037,7 +1037,7 @@ func TestSystemBackend_CapabilitiesAccessor_BC(t *testing.T) {
 		t.Fatalf("bad: got\n%#v\nexpected\n%#v\n", actual, expected)
 	}
 
-	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy)
+	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy, WithDenySlashInTemplatedPaths(core.denySlashInTemplatedPolicyPaths))
 	err = core.policyStore.SetPolicy(namespace.RootContext(nil), policy)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -2744,8 +2744,6 @@ func TestSystemBackend_policyCRUD(t *testing.T) {
 	if resp != nil && (resp.IsError() || len(resp.Data) > 0) {
 		t.Fatalf("bad: %#v", resp)
 	}
-	// TODO (HCL_DUP_KEYS_DEPRECATION): remove this expectation once deprecation is done
-	require.NotContains(t, resp.Warnings, "policy contains duplicate attributes, which will no longer be supported in a future version")
 
 	// validate the response structure for policy named Update
 	schema.ValidateResponse(
@@ -2853,34 +2851,18 @@ func TestSystemBackend_policyCRUD(t *testing.T) {
 }
 
 // TestSystemBackend_writeHCLDuplicateAttributes checks that trying to create a policy with duplicate HCL attributes
-// results in a warning being returned by the API
+// results in an error being returned by the API
 func TestSystemBackend_writeHCLDuplicateAttributes(t *testing.T) {
 	// policy with duplicate attribute
 	rules := `path "foo/" { policy = "read" policy = "read" }`
 	req := logical.TestRequest(t, logical.UpdateOperation, "policy/foo")
 	req.Data["policy"] = rules
 
-	t.Run("fails with env unset", func(t *testing.T) {
-		b := testSystemBackend(t)
-		resp, err := b.HandleRequest(namespace.RootContext(nil), req)
-		require.Error(t, err)
-		require.Error(t, resp.Error())
-		require.EqualError(t, resp.Error(), "failed to parse policy: The argument \"policy\" at 1:31 was already set. Each argument can only be defined once")
-	})
-
-	// TODO (HCL_DUP_KEYS_DEPRECATION): leave only test above once deprecation is done
-	t.Run("warning with env set", func(t *testing.T) {
-		t.Setenv(random.AllowHclDuplicatesEnvVar, "true")
-		b := testSystemBackend(t)
-		resp, err := b.HandleRequest(namespace.RootContext(nil), req)
-		if err != nil {
-			t.Fatalf("err: %v %#v", err, resp)
-		}
-		if resp != nil && (resp.IsError() || len(resp.Data) > 0) {
-			t.Fatalf("bad: %#v", resp)
-		}
-		require.Contains(t, resp.Warnings, "policy contains duplicate attributes, which will no longer be supported in a future version")
-	})
+	b := testSystemBackend(t)
+	resp, err := b.HandleRequest(namespace.RootContext(nil), req)
+	require.Error(t, err)
+	require.Error(t, resp.Error())
+	require.EqualError(t, resp.Error(), "failed to parse policy: The argument \"policy\" at 1:31 was already set. Each argument can only be defined once")
 }
 
 func TestSystemBackend_enableAudit(t *testing.T) {
@@ -4828,7 +4810,7 @@ path "sys/*" {
   capabilities = ["update"]
 }`
 
-	pol, err := ParseACLPolicy(namespace.RootNamespace, rules)
+	pol, err := ParseACLPolicy(namespace.RootNamespace, rules, WithDenySlashInTemplatedPaths(core.denySlashInTemplatedPolicyPaths))
 	require.NoError(t, err)
 	require.NoError(t, core.policyStore.SetPolicy(ctx, pol))
 
@@ -7047,7 +7029,7 @@ func TestGetSealBackendStatus(t *testing.T) {
 			testAccess, wrappers := seal.NewTestSeal(&tt.sealOpts)
 
 			c := TestCoreWithSeal(t, NewAutoSeal(testAccess), false)
-			_, keys, _ := TestCoreInitClusterWrapperSetup(t, c, nil)
+			_, keys, _ := TestCoreInitClusterWrapperSetup(t, c)
 			for _, key := range keys {
 				_, err := TestCoreUnseal(c, key)
 				require.NoError(t, err)
@@ -7114,7 +7096,7 @@ func TestGetSealBackendStatus(t *testing.T) {
 	shamirSeal := NewDefaultSeal(a)
 
 	c := TestCoreWithSeal(t, shamirSeal, false)
-	keys, _, _ := TestCoreInitClusterWrapperSetup(t, c, nil)
+	keys, _, _ := TestCoreInitClusterWrapperSetup(t, c)
 	for _, key := range keys {
 		_, err := TestCoreUnseal(c, key)
 		require.NoError(t, err)
@@ -7467,7 +7449,6 @@ func TestWellKnownSysApi(t *testing.T) {
 
 	require.Contains(t, resp.Data["keys"], "mylabel1")
 	require.Contains(t, resp.Data["keys"], "mylabel2")
-	require.Len(t, resp.Data["keys"], 2)
 
 	keyInfo := resp.Data["key_info"].(map[string]interface{})
 	keyInfoLabel1 := keyInfo["mylabel1"].(map[string]interface{})

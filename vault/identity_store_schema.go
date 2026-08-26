@@ -16,6 +16,7 @@ const (
 	groupAliasesTable          = "group_aliases"
 	oidcClientsTable           = "oidc_clients"
 	scimClientsTable           = "scim_clients"
+	tpmsTable                  = "tpms"
 	factorsIndex               = "factors"
 	issuerAndExternalIdFactors = "issuer_externalid_factors"
 )
@@ -32,6 +33,8 @@ func identityStoreSchema(lowerCaseName bool) *memdb.DBSchema {
 		groupAliasesTableSchema,
 		oidcClientsTableSchema,
 		scimClientSchema,
+		tpmsTableSchema,
+		tpmgroupsTableSchema,
 	}
 
 	for _, schemaFunc := range schemas {
@@ -185,6 +188,7 @@ func entitiesTableSchema(lowerCaseName bool) *memdb.TableSchema {
 					Indexes: []memdb.Indexer{
 						&memdb.StringFieldIndex{Field: "NamespaceID"},
 						&memdb.StringFieldIndex{Field: "ScimClientID"},
+						&memdb.StringFieldIndex{Field: "Name"},
 					},
 				},
 			},

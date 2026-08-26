@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2016, 2025
+// Copyright IBM Corp. 2016, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package client
@@ -21,6 +21,7 @@ import (
 // Client is the local git client.
 type Client struct {
 	Token   string
+	Host    string
 	envOnce sync.Once
 	envVal  []string
 	config  map[string]string
@@ -68,6 +69,14 @@ func WithToken(token string) NewClientOpt {
 	}
 }
 
+// WithHost sets the git remote host used in credential URL rewrites.
+// When not set, defaults to "github.com".
+func WithHost(host string) NewClientOpt {
+	return func(client *Client) {
+		client.Host = host
+	}
+}
+
 // WithConfig sets additional gitconfig in NewClient()
 func WithConfig(config map[string]string) NewClientOpt {
 	return func(client *Client) {
@@ -106,7 +115,8 @@ func (c *Client) Exec(ctx context.Context, subCmd string, opts OptStringer) (*Ex
 	var err error
 	res.Stdout, err = cmd.Output()
 	if err != nil {
-		slog.Default().ErrorContext(slogctx.Append(ctx,
+		slog.Default().ErrorContext(slogctx.Append(
+			ctx,
 			slog.String("error", err.Error()),
 		), "executing git command failed")
 		var exitErr *exec.ExitError
@@ -155,8 +165,12 @@ func (c *Client) configEnv() []string {
 			// have different rules around the user in the auth portion of the URL.
 			// Github doesn't care what the username is but requires one to be set so
 			// we always set it to user.
+			host := c.Host
+			if host == "" {
+				host = "github.com"
+			}
 			token := url.UserPassword("user", c.Token).String()
-			env[fmt.Sprintf("url.https://%s@github.com.insteadOf", token)] = "https://github.com"
+			env[fmt.Sprintf("url.https://%s@%s.insteadOf", token, host)] = "https://" + host
 		}
 
 		vars := []string{fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(env))}

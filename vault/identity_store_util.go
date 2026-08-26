@@ -10,16 +10,15 @@ import (
 	"maps"
 	"math/rand"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	metrics "github.com/armon/go-metrics"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/hashicorp/errwrap"
 	memdb "github.com/hashicorp/go-memdb"
+	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/hashicorp/go-secure-stdlib/strutil"
 	uuid "github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/vault/helper/activationflags"
@@ -109,6 +108,14 @@ func (i *IdentityStore) loadArtifacts(ctx context.Context, isActive bool) error 
 		}
 
 		i.startSCIMDeletingClientCleanup(ctx, isActive)
+
+		if err := i.loadTPMs(ctx); err != nil {
+			return fmt.Errorf("failed to load TPMs: %w", err)
+		}
+
+		if err := i.loadTPMGroups(ctx); err != nil {
+			return fmt.Errorf("failed to load TPMGroups: %w", err)
+		}
 
 		return nil
 	}
@@ -661,7 +668,8 @@ LOOP:
 					// operator via delete or merge.
 					integrityCheck, err := checkEntityIntegrity(entity)
 					if err != nil {
-						i.logger.Warn("identity entity integrity check failed; attempting to repair",
+						i.logger.Warn(
+							"identity entity integrity check failed; attempting to repair",
 							"entity_id", entity.ID,
 							"has_nil_aliases", integrityCheck.hasNilAliases,
 							"dangling_aliases", integrityCheck.danglingAliases,
@@ -677,7 +685,8 @@ LOOP:
 						}
 
 						if !(i.localNode.ReplicationState().HasState(consts.ReplicationPerformanceSecondary) || i.localNode.HAState() == consts.PerfStandby) {
-							i.logger.Warn("persisting repaired identity entity",
+							i.logger.Warn(
+								"persisting repaired identity entity",
 								"name", entity.Name,
 								"id", entity.ID,
 								"namespace_id", entity.NamespaceID,
@@ -971,7 +980,8 @@ func (i *IdentityStore) upsertEntityInTxn(ctx context.Context, txn *memdb.Txn, e
 			// ConflictResolver implementation, the behavior here is a bit nuanced.
 			// Rather than introduce a behavior change, we handle this case directly
 			// as before by merging.
-			i.logger.Warn("alias is already tied to a different entity; these entities are being merged",
+			i.logger.Warn(
+				"alias is already tied to a different entity; these entities are being merged",
 				"alias_id", alias.ID,
 				"other_entity_id", aliasByFactors.CanonicalID,
 				"entity_aliases", entity.Aliases,
@@ -1092,13 +1102,24 @@ func (i *IdentityStore) processLocalAlias(ctx context.Context, lAlias *logical.A
 		}
 	}
 
-	mountValidationResp := i.router.ValidateMountByAccessor(lAlias.MountAccessor)
-	if mountValidationResp == nil {
-		return nil, fmt.Errorf("invalid mount accessor %q", lAlias.MountAccessor)
+	var mountValidationResp *ValidateMountResponse
+	var isSyntheticLocal bool
+	if i.syntheticAliasAccessorValidator != nil {
+		valid, isLocal, err := i.syntheticAliasAccessorValidator.validateSyntheticAliasAccessor(ctx, lAlias.MountAccessor)
+		if err == nil && valid && isLocal {
+			isSyntheticLocal = true
+		}
 	}
 
-	if !mountValidationResp.MountLocal {
-		return nil, fmt.Errorf("mount accessor %q is not local", lAlias.MountAccessor)
+	if !isSyntheticLocal {
+		mountValidationResp = i.router.ValidateMountByAccessor(lAlias.MountAccessor)
+		if mountValidationResp == nil {
+			return nil, fmt.Errorf("invalid mount accessor %q", lAlias.MountAccessor)
+		}
+
+		if !mountValidationResp.MountLocal {
+			return nil, fmt.Errorf("mount accessor %q is not local", lAlias.MountAccessor)
+		}
 	}
 
 	alias, err := i.MemDBAliasByFactors(lAlias.MountAccessor, lAlias.Name, true, false)
@@ -1145,8 +1166,10 @@ func (i *IdentityStore) processLocalAlias(ctx context.Context, lAlias *logical.A
 	alias.Name = lAlias.Name
 	alias.MountAccessor = lAlias.MountAccessor
 	alias.Metadata = lAlias.Metadata
-	alias.MountPath = mountValidationResp.MountPath
-	alias.MountType = mountValidationResp.MountType
+	if mountValidationResp != nil {
+		alias.MountPath = mountValidationResp.MountPath
+		alias.MountType = mountValidationResp.MountType
+	}
 	alias.Local = lAlias.Local
 	alias.CustomMetadata = lAlias.CustomMetadata
 	alias.Issuer = lAlias.Issuer
@@ -1806,6 +1829,9 @@ func (i *IdentityStore) MemDBLocalAliasesByBucketKeyInTxn(txn *memdb.Txn, bucket
 	for item := iter.Next(); item != nil; item = iter.Next() {
 		alias := item.(*identity.Alias)
 		if alias.Local {
+			// The returned aliases are only compared (via proto.Equal, which is
+			// safe on shared protobuf messages) and referenced by ID, never
+			// mutated, so they do not need to be cloned.
 			aliases = append(aliases, alias)
 		}
 	}
@@ -1958,97 +1984,16 @@ func (i *IdentityStore) MemDBDeleteEntityByID(entityID string) error {
 	return nil
 }
 
-func (i *IdentityStore) MemDBEntitiesByScimClientID(ctx context.Context, scimClientID string, maxResultSet int) ([]*identity.Entity, error) {
-	if scimClientID == "" {
-		return nil, nil
-	}
-
-	txn := i.db.Txn(false)
-	defer txn.Abort()
-
-	entities, err := i.MemDBEntitiesByScimClientIDInTxn(ctx, txn, scimClientID, maxResultSet)
-	if err != nil {
-		return nil, err
-	}
-
-	return entities, nil
-}
-
 // MemDBEntitiesByScimClientIDInTxn retrieves a fully sorted list of all entities
 // belonging to a specific SCIM client.
 //
-// Implementation Pattern: Filter-Then-Sort
-// This function implements the "filter then sort" pattern, which is the idiomatic
-// approach for this type of query in go-memdb. The process involves two steps:
-//  1. Filtering: A simple two-part compound index on `(NamespaceID, ScimClientID)`
-//     is used with `txn.Get()` to efficiently retrieve all entities for the client.
-//  2. Sorting: The resulting slice of entities is then sorted in-memory by name
-//     using Go's native `sort.Slice`.
+// The three-part CompoundIndex on (NamespaceID, ScimClientID, Name) is queried
+// via a prefix lookup on (NamespaceID, ScimClientID), which causes go-memdb to
+// return results already sorted by Name. This avoids the need for an extra
+// in-memory sort step.
 //
-// Why This Pattern is Used (memdb Limitations):
-// It might seem more efficient to perform the sorting at the database level
-// using a single ordered index, memdb's built-in `CompoundIndex` does not support
-// using a partial key (e.g., just `NamespaceID` and `ScimClientID`) to get an
-// ordered iterator over the remaining fields (e.g., `Name`). The indexer's
-// internal `FromArgs` method requires a value for every field defined in the index.
-// This makes a single-operation "filter and ordered scan" impossible with the
-// standard indexers.
-//
-// Given that go-memdb is an in-memory database, sorting a pre-filtered slice
-// is extremely fast and avoids the complexity of creating a custom indexer.
 // This function returns the entire sorted list; the caller is responsible for
 // any subsequent pagination.
-func (i *IdentityStore) MemDBEntitiesByScimClientIDInTxn(ctx context.Context, txn *memdb.Txn, scimClientID string, maxResultSet int) ([]*identity.Entity, error) {
-	if txn == nil {
-		return nil, fmt.Errorf("nil txn")
-	}
-
-	if scimClientID == "" {
-		return nil, fmt.Errorf("empty scim client id key")
-	}
-
-	ns, err := namespace.FromContext(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	ws := memdb.NewWatchSet()
-
-	entitiesIter, err := txn.Get(entitiesTable, "scim_client_id", ns.ID, scimClientID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to lookup entities using scim client id: %w", err)
-	}
-
-	ws.Add(entitiesIter.WatchCh())
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-			break
-		}
-
-		var entities []*identity.Entity
-		for item := entitiesIter.Next(); item != nil; item = entitiesIter.Next() {
-			if len(entities) > maxResultSet {
-				return nil, fmt.Errorf("query returned more than the server's limit of %d results. Please use more specific filters", maxResultSet)
-			}
-
-			entity, err := item.(*identity.Entity).Clone()
-			if err != nil {
-				return nil, err
-			}
-			entities = append(entities, entity)
-		}
-
-		sort.Slice(entities, func(i, j int) bool {
-			return entities[i].Name < entities[j].Name
-		})
-
-		return entities, nil
-	}
-}
 
 // FetchEntityForLocalAliasInTxn fetches the entity associated with the provided
 // local identity.Alias. MemDB will first be searched for the entity. If it is
@@ -2811,43 +2756,6 @@ func (i *IdentityStore) MemDBGroupByID(groupID string, clone bool) (*identity.Gr
 	txn := i.db.Txn(false)
 
 	return i.MemDBGroupByIDInTxn(txn, groupID, clone)
-}
-
-func (i *IdentityStore) MemDBGroupsByScimClientIDInTxn(txn *memdb.Txn, scimClientID string) ([]*identity.Group, error) {
-	if scimClientID == "" {
-		return nil, fmt.Errorf("missing scim client ID")
-	}
-
-	if txn == nil {
-		return nil, fmt.Errorf("txn is nil")
-	}
-
-	groupsIter, err := txn.Get(groupsTable, "scim_client_id", scimClientID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to lookup groups using scim client ID: %w", err)
-	}
-
-	var groups []*identity.Group
-	for group := groupsIter.Next(); group != nil; group = groupsIter.Next() {
-		entry := group.(*identity.Group)
-		entry, err = entry.Clone()
-		if err != nil {
-			return nil, err
-		}
-		groups = append(groups, entry)
-	}
-
-	return groups, nil
-}
-
-func (i *IdentityStore) MemDBGroupsByScimClientID(scimClientID string) ([]*identity.Group, error) {
-	if scimClientID == "" {
-		return nil, fmt.Errorf("missing scim client ID")
-	}
-
-	txn := i.db.Txn(false)
-
-	return i.MemDBGroupsByScimClientIDInTxn(txn, scimClientID)
 }
 
 func (i *IdentityStore) MemDBGroupsByParentGroupIDInTxn(txn *memdb.Txn, memberGroupID string, clone bool) ([]*identity.Group, error) {
@@ -3620,7 +3528,7 @@ func (i *IdentityStore) MakeDeduplicationDoneChan() {
 	i.lock.Lock()
 	defer i.lock.Unlock()
 
-	i.activateDeduplicationDone = make(chan struct{})
+	i.activateDeduplicationDone = make(chan struct{}, 1)
 }
 
 // WaitForActivateDeduplicationDone is a test helper to wait for the identity
