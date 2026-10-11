@@ -68,9 +68,11 @@ enos/**/support
 enos/**/kubeconfig
 enos/modules/**/plan.yml
 enos/sarif**.json
-.terraform
-.terraform.lock.hcl
-.tfstate.*
+**/.terraform/*
+**.terraform.lock.hcl
+**terraform.tfstate
+**.tfstate.*
+**.terraform.tfstate.lock.info
 
 .DS_Store
 .idea
@@ -141,14 +143,17 @@ tools/pipeline/.bin
 tools/pipeline/pipeline
 .ci-bootstrap
 
-# Ignore stubmaker outputs on ent so they don't get checked in
-*_stubs_ent.go
-
 # scratch directory holding random stuff
 scratch
 
 # ignore Idea/Goland .run directory
 .run
 
-# bob
+# .agents/
+.agents/tmp
+# per-engineer agent preferences
+.agents/preferences/user.preferences.md
+
+# .bob/
 .bob/notes
+.bob/tmp

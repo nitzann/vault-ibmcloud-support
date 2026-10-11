@@ -15,6 +15,7 @@ import {
   HTTPQuery,
   HTTPRequestInit,
   RequestOpts,
+  RequiredError,
   ResponseError,
 } from '@hashicorp/vault-client-typescript';
 import config from 'vault/config/environment';
@@ -24,8 +25,16 @@ import type AuthService from 'vault/services/auth';
 import type NamespaceService from 'vault/services/namespace';
 import type ControlGroupService from 'vault/services/control-group';
 import type FlashMessageService from 'vault/services/flash-messages';
-import type { HeaderMap, XVaultHeaders } from 'vault/api';
+import type { HeaderMap, ApiErrorResponse, ApiParsedError, XVaultHeaders } from 'vault/api';
 import type { HTTPMethod } from '@hashicorp/vault-client-typescript';
+
+/** Maps namespace keys to their typed generated-client classes. */
+type ApiNamespaces = {
+  auth: AuthApi;
+  identity: IdentityApi;
+  secrets: SecretsApi;
+  sys: SystemApi;
+};
 
 export default class ApiService extends Service {
   @service('auth') declare readonly authService: AuthService;
@@ -125,8 +134,14 @@ export default class ApiService extends Service {
     }
     // if the requested path is locked by a control group we need to create a new error response
     const json = await this.readJson(response);
+
+    // derive from REQUEST, not response - transit export is making an api request but trying to also set vault header on the request, not the response - causing a control group error.
+    const wasWrapTTLRequested = (context.init.headers as Headers)?.get?.('X-Vault-Wrap-TTL');
     const wrapTtl = headers.get('X-Vault-Wrap-TTL');
-    const isLockedByControlGroup = this.controlGroup.isRequestedPathLocked(json, wrapTtl);
+    const isLockedByControlGroup = this.controlGroup.isRequestedPathLocked(
+      json,
+      wasWrapTTLRequested ? wasWrapTTLRequested : wrapTtl
+    );
 
     if (isLockedByControlGroup && json) {
       const error = {
@@ -159,6 +174,48 @@ export default class ApiService extends Service {
   identity = new IdentityApi(this.configuration);
   secrets = new SecretsApi(this.configuration);
   sys = new SystemApi(this.configuration);
+
+  /**
+   * Calls a method on one of the four API namespace clients (`auth`, `identity`,
+   * `secrets`, `sys`) in a way that is fully type-checked on the branch where the
+   * method exists, but compiles silently on older branches where it may be absent.
+   *
+   * Pass the namespace key as the first argument and a callback that receives the
+   * typed client as the second. On the current branch the client is typed as its
+   * real generated-client class, giving full autocomplete, method name checking, and
+   * argument validation. On older branches the internal `as any` cast silences the
+   * missing-method error without widening the callback's apparent type.
+   *
+   * **Only call this method inside a `this.version.hasFeature(...)` gate.**
+   * The ESLint rule `require-version-guard` enforces this — unguarded usage will
+   * cause a lint error in CI.
+   *
+   * @example
+   * ```ts
+   * if (this.version.hasFeature('agents')) {
+   *   const result = await this.api.versioned('sys', (sys) => sys.newAgentMethod(params));
+   * }
+   * ```
+   *
+   * @see vault/utils/feature-versions — register new version-gated features here
+   * @see ui/docs/versioned-api-calls.md — full guide to the version-gating pattern
+   */
+  versioned<K extends keyof ApiNamespaces, R>(namespace: K, fn: (client: ApiNamespaces[K]) => R): R {
+    const namespaces: ApiNamespaces = {
+      auth: this.auth,
+      identity: this.identity,
+      secrets: this.secrets,
+      sys: this.sys,
+    };
+    // The `as any` cast is an implementation detail confined to this line. It does NOT
+    // affect the type seen by the caller's callback — TypeScript resolves `fn`'s parameter
+    // type from the generic signature (`ApiNamespaces[K]`) at the call site, before this
+    // body is evaluated. On the current branch the callback argument is fully typed as the
+    // real generated-client class; on older branches the cast silences the missing-method
+    // error without widening anything visible to the caller.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return fn(namespaces[namespace] as any);
+  }
 
   // convenience method for overriding headers for given requests to ensure consistency
   // eg. this.api.sys.wrap(data, { headers: { 'X-Vault-Wrap-TTL': wrap } });
@@ -196,53 +253,59 @@ export default class ApiService extends Service {
   // accepts an error response and returns { status, message, response, path }
   // message is built as error.errors joined with a comma, error.message or a fallback message
   // path is the url of the request, minus the origin -> /v1/sys/wrapping/unwrap
-  parseError = waitFor(async (e: unknown, fallbackMessage = 'An error occurred, please try again') => {
-    if (e instanceof ResponseError) {
-      const { status, url } = e.response;
-      // instances where an error is thrown multiple times could result in the body already being read
-      // this will result in a readable stream failure and we can't parse the body
-      // to avoid this, clone the response so we can access the body consistently
-      const error = await e.response.clone().json();
-      // typically the Vault API error response looks like { errors: ['some error message'] }
-      // but sometimes (eg RespondWithStatusCode) it's { data: { error: 'some error message' } }
-      const errors = error.data?.error && !error.errors ? [error.data.error] : error.errors;
-      const message = errors && typeof errors[0] === 'string' ? errors.join(', ') : error.message;
+  parseError = waitFor(
+    async (e: unknown, fallbackMessage = 'An error occurred, please try again'): Promise<ApiParsedError> => {
+      if (e instanceof ResponseError) {
+        const { status, url } = e.response;
+        // instances where an error is thrown multiple times could result in the body already being read
+        // this will result in a readable stream failure and we can't parse the body
+        // to avoid this, clone the response so we can access the body consistently
+        const error = (await e.response.clone().json()) as ApiErrorResponse;
+        // typically the Vault API error response looks like { errors: ['some error message'] }
+        // but sometimes (eg RespondWithStatusCode) it's { data: { error: 'some error message' } }
+        const errors = error.data?.error && !error.errors ? [error.data.error] : error.errors;
+        const message = errors && typeof errors[0] === 'string' ? errors.join(', ') : error.message;
+
+        return {
+          message: message || fallbackMessage,
+          status,
+          path: decodeURIComponent(url.replace(document.location.origin, '')),
+          response: error,
+        };
+      }
+
+      // log out generic error for ease of debugging in dev env
+      if (config.environment === 'development') {
+        console.error('API Error:', e);
+      }
+
+      // RequiredError indicates a client-side bug, not something actionable by the user, so log it
+      // for debugging but return the generic fallback instead of its raw internal message.
+      if (e instanceof RequiredError) {
+        console.error(e);
+        return { message: fallbackMessage };
+      }
 
       return {
-        message: message || fallbackMessage,
-        status,
-        path: decodeURIComponent(url.replace(document.location.origin, '')),
-        response: error,
+        message: (e as Error)?.message || fallbackMessage,
       };
     }
-
-    // log out generic error for ease of debugging in dev env
-    if (config.environment === 'development') {
-      console.error('API Error:', e);
-    }
-
-    return {
-      message: (e as Error)?.message || fallbackMessage,
-    };
-  });
+  );
 
   // accepts a list response as { key_info, keys } and returns a flat array of the key_info datum
   // to preserve the keys (unique identifiers) the value will be set on the datum as the provided uuidKey or id
-  keyInfoToArray(response: unknown = {}, uuidKey = 'id') {
+  keyInfoToArray<T = Record<string, unknown>>(response: unknown = {}, uuidKey = 'id'): T[] {
     const { key_info, keys } = response as { key_info?: Record<string, unknown>; keys?: string[] };
     if (!key_info || !keys) {
       return [];
     }
-    return keys.reduce(
-      (arr, key) => {
-        const datum = key_info[key];
-        if (datum) {
-          arr.push({ [uuidKey]: key, ...datum });
-        }
-        return arr;
-      },
-      [] as Record<string, unknown>[]
-    );
+    return keys.reduce((arr, key) => {
+      const datum = key_info[key];
+      if (datum) {
+        arr.push({ [uuidKey]: key, ...datum } as T);
+      }
+      return arr;
+    }, [] as T[]);
   }
 
   // some responses return an object with a uuid as the key rather than an array

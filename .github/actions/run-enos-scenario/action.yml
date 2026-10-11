@@ -100,19 +100,25 @@ runs:
   steps:
     - if: inputs.setup-terraform == 'true'
       name: Setup Terraform
-      uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
+      uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
       with:
         terraform_wrapper: false
 
     - if: inputs.setup-enos == 'true'
       name: Setup Enos
-      uses: hashicorp/action-setup-enos@6ec106c8f809fe645162d73bea565c65f3269907 # v1.52
+      uses: hashicorp/action-setup-enos@bfd47bdf7d118b9372acfaab048bcb9967026747 # v1.54
 
     - id: prepare-artifacts
       name: Prepare artifacts and debug directory
       shell: bash
       run: |
-        artifact_name="enos-debug-data_$(echo "${{ inputs.scenario-filter }}" | sed -e 's/ /_/g' | sed -e 's/:/=/g')"
+        # Determine our debug data artifact name. We'll convert the scenario
+        # name into a safe file name, reduce it down and add some random chars
+        # to avoid very unlikely name conflicts. We don't use the full scenario
+        # as we want to ensure we're well below the 255 char max.
+        scenario_name="$(echo "${{ inputs.scenario-filter }}" | sed -e 's/ /_/g' | sed -e 's/:/=/g')"
+        random_suffix=$(printf '%05d' $RANDOM)
+        artifact_name="enos-debug-data_${scenario_name:0:207}_${random_suffix}"
         debug_dir="${{ inputs.debug-data-path }}"
         if [ -z "${debug_dir}" ]; then
           debug_dir="${ENOS_DEBUG_DATA_ROOT_DIR:-/tmp/enos-debug-data}"
@@ -154,11 +160,19 @@ runs:
       name: Retry Enos scenario
       shell: bash
       run: |
-        if ! output=$(enos scenario launch \
+        set +e
+        stderr_file=$(mktemp)
+        enos scenario launch \
           --timeout ${{ inputs.retry-timeout }} \
           ${{ inputs.retry-extra-args }} \
           --chdir ${{ inputs.working-directory }} \
-          ${{ inputs.scenario-filter }} 2>&1); then
+          ${{ inputs.scenario-filter }} 2> >(tee "${stderr_file}" >&2)
+        launch_exit=$?
+        wait  # drain the tee subprocess before reading the file
+        set -e
+        if [ "${launch_exit}" -ne 0 ]; then
+          output=$(cat "${stderr_file}")
+          rm -f "${stderr_file}"
           if [ "${{ inputs.show-state-on-retry }}" = "true" ]; then
             echo "::group::Scenario state after retry"
             enos scenario exec --cmd show \
@@ -172,7 +186,6 @@ runs:
             echo "::endgroup::"
           fi
           echo "::group::Scenario retry failure"
-          echo "$output" >&2
           {
             echo "# Enos Scenario Failed!"
             echo 'See the [workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for more information'
@@ -183,6 +196,7 @@ runs:
           echo "::endgroup::"
           exit 1
         fi
+        rm -f "${stderr_file}"
 
     - id: determine-launch-outcome
       name: Determine launch outcome
@@ -205,7 +219,7 @@ runs:
     - if: failure() && inputs.upload-debug-data == 'true'
       name: Upload debug data
       continue-on-error: true
-      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: ${{ steps.prepare-artifacts.outputs.debug-data-artifact-name }}
         path: ${{ steps.prepare-artifacts.outputs.debug-data-dir }}

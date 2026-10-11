@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: BUSL-1.1
  */
 
-import { expect, test } from '@playwright/test';
+import { expect } from '@playwright/test';
+import { test } from '../../fixtures/demo';
 import { BasePage } from '../../pages/base';
 import { ConfigurationSettingsPage } from '../../pages/configuration-settings';
 
@@ -28,7 +29,7 @@ test('transform workflow', async ({ page }) => {
     await page.getByRole('option', { name: 'builtin/socialsecuritynumber' }).click();
     await page.getByRole('button', { name: 'Create transformation' }).click();
     await page.getByRole('link', { name: 'transform-test' }).click();
-    await expect(page.getByText('test-transformation', { exact: true })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'test-transformation', exact: true })).toBeVisible();
   });
 
   await test.step('Role can be created', async () => {
@@ -50,6 +51,7 @@ test('transform workflow', async ({ page }) => {
     await page.getByRole('textbox', { name: 'Pattern' }).fill('`^(19)');
     await page.getByText('Search').click();
     await page.getByRole('option', { name: 'builtin/alphalower' }).click();
+    await basePage.dismissFlashMessages();
     await page.getByRole('button', { name: 'Create template' }).click();
   });
 

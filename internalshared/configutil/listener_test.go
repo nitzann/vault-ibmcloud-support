@@ -412,6 +412,8 @@ func TestListener_parseTLSSettings(t *testing.T) {
 		expectedTLSRequireAndVerifyClientCert bool
 		rawTLSDisableClientCerts              any
 		expectedTLSDisableClientCerts         bool
+		rawTLSReloadInterval                  any
+		expectedTLSReloadInterval             time.Duration
 		isErrorExpected                       bool
 		errorMessage                          string
 	}{
@@ -458,6 +460,41 @@ func TestListener_parseTLSSettings(t *testing.T) {
 			expectedTLSDisableClientCerts: true,
 			isErrorExpected:               false,
 		},
+		"tls-reload-interval-bad": {
+			rawTLSReloadInterval: "juan",
+			isErrorExpected:      true,
+			errorMessage:         "invalid value for tls_reload_interval",
+		},
+		"tls-reload-interval-negative": {
+			rawTLSReloadInterval: "-1s",
+			isErrorExpected:      true,
+			errorMessage:         "invalid value for tls_reload_interval: must not be negative",
+		},
+		"tls-reload-interval-too-small": {
+			rawTLSReloadInterval: "500ms",
+			isErrorExpected:      true,
+			errorMessage:         "invalid value for tls_reload_interval: must be at least 1s",
+		},
+		"tls-reload-interval-too-large": {
+			rawTLSReloadInterval: "8760h",
+			isErrorExpected:      true,
+			errorMessage:         "invalid value for tls_reload_interval: must be at most 24h0m0s",
+		},
+		"tls-reload-interval-at-max": {
+			rawTLSReloadInterval:      "24h",
+			expectedTLSReloadInterval: 24 * time.Hour,
+			isErrorExpected:           false,
+		},
+		"tls-reload-interval-zero-disables": {
+			rawTLSReloadInterval:      "0s",
+			expectedTLSReloadInterval: 0,
+			isErrorExpected:           false,
+		},
+		"tls-reload-interval-good": {
+			rawTLSReloadInterval:      "30s",
+			expectedTLSReloadInterval: 30 * time.Second,
+			isErrorExpected:           false,
+		},
 	}
 
 	for name, tc := range tests {
@@ -472,6 +509,7 @@ func TestListener_parseTLSSettings(t *testing.T) {
 				TLSCipherSuitesRaw:               tc.rawTLSCipherSuites,
 				TLSRequireAndVerifyClientCertRaw: tc.rawTLSRequireAndVerifyClientCert,
 				TLSDisableClientCertsRaw:         tc.rawTLSDisableClientCerts,
+				TLSReloadIntervalRaw:             tc.rawTLSReloadInterval,
 			}
 
 			err := l.parseTLSSettings()
@@ -487,12 +525,14 @@ func TestListener_parseTLSSettings(t *testing.T) {
 				require.Equal(t, tc.expectedTLSCipherSuites, l.TLSCipherSuites)
 				require.Equal(t, tc.expectedTLSRequireAndVerifyClientCert, l.TLSRequireAndVerifyClientCert)
 				require.Equal(t, tc.expectedTLSDisableClientCerts, l.TLSDisableClientCerts)
+				require.Equal(t, tc.expectedTLSReloadInterval, l.TLSReloadInterval)
 
 				// Ensure the state was modified for the raw values.
 				require.Nil(t, l.TLSDisableRaw)
 				require.Empty(t, l.TLSCipherSuitesRaw)
 				require.Nil(t, l.TLSRequireAndVerifyClientCertRaw)
 				require.Nil(t, l.TLSDisableClientCertsRaw)
+				require.Nil(t, l.TLSReloadIntervalRaw)
 			}
 		})
 	}
@@ -1122,6 +1162,67 @@ func TestListener_parseChrootNamespaceSettings(t *testing.T) {
 
 				// Ensure the state was modified for the raw values.
 				require.Nil(t, l.ChrootNamespaceRaw)
+			}
+		})
+	}
+}
+
+// TestListener_parseOperatorNamespaceSettings exercises the listener receiver parseOperatorNamespaceSettings.
+// This test validates that the operator_namespace_path setting is properly canonicalized.
+func TestListener_parseOperatorNamespaceSettings(t *testing.T) {
+	tests := map[string]struct {
+		rawOperatorNamespacePath      any
+		expectedOperatorNamespacePath string
+		isErrorExpected               bool
+		errorMessage                  string
+	}{
+		"nil": {
+			isErrorExpected: false,
+		},
+		"empty_string": {
+			rawOperatorNamespacePath:      "",
+			expectedOperatorNamespacePath: "",
+			isErrorExpected:               false,
+		},
+		"bad_type": {
+			rawOperatorNamespacePath: &Listener{}, // Unsure how we'd ever see this really.
+			isErrorExpected:          true,
+			errorMessage:             "invalid value for operator_namespace_path",
+		},
+		"good": {
+			rawOperatorNamespacePath:      "operator",
+			expectedOperatorNamespacePath: "operator/",
+			isErrorExpected:               false,
+		},
+		"good_with_trailing_slash": {
+			rawOperatorNamespacePath:      "operator/",
+			expectedOperatorNamespacePath: "operator/",
+			isErrorExpected:               false,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			// Configure listener with raw values
+			l := &Listener{
+				OperatorNamespacePathRaw: tc.rawOperatorNamespacePath,
+			}
+
+			err := l.parseOperatorNamespaceSettings()
+
+			switch {
+			case tc.isErrorExpected:
+				require.Error(t, err)
+				require.ErrorContains(t, err, tc.errorMessage)
+			default:
+				// Assert we got the relevant values.
+				require.NoError(t, err)
+				require.Equal(t, tc.expectedOperatorNamespacePath, l.OperatorNamespacePath)
+
+				// Ensure the state was modified for the raw values.
+				require.Nil(t, l.OperatorNamespacePathRaw)
 			}
 		})
 	}

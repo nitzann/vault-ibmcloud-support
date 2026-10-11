@@ -18,10 +18,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/armon/go-metrics"
 	"github.com/armon/go-radix"
 	"github.com/golang/protobuf/proto"
 	log "github.com/hashicorp/go-hclog"
+	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-secure-stdlib/base62"
 	"github.com/hashicorp/go-secure-stdlib/parseutil"
@@ -29,8 +29,8 @@ import (
 	"github.com/hashicorp/go-sockaddr"
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/vault/helper/identity"
-	"github.com/hashicorp/vault/helper/metricsutil"
-	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/internalshared/metricsutil"
+	"github.com/hashicorp/vault/internalshared/namespace"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/consts"
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
@@ -91,13 +91,14 @@ const (
 	// MaxRetrySSCTokensGenerationCounter is the maximum number of retries the TokenStore
 	// will make when attempting to get the SSCTokensGenerationCounter
 	MaxRetrySSCTokensGenerationCounter = 3
-
-	// IgnoreForBilling used for HCP Link batch tokens and inserted into the InternalMeta
-	// Tokens created for the purpose of HCP Link should bypass counting for billing purposes
-	IgnoreForBilling = "ignore_for_billing"
 )
 
 var (
+	// ErrFullJWTRequired is returned by auth/token/revoke and
+	// auth/token/revoke-orphan when given the internal stored JWT ID form
+	// instead of the full JWT.
+	ErrFullJWTRequired = errors.New("OAuth JWTs must be revoked using the full JWT, not the internal Vault storage ID. Provide full JWT or use auth/token/revoke-oauth")
+
 	// displayNameSanitize is used to sanitize a display name given to a token.
 	displayNameSanitize = regexp.MustCompile("[^a-zA-Z0-9-]")
 
@@ -121,7 +122,7 @@ var (
 		view := storage.(*BarrierView)
 
 		switch {
-		case te.NamespaceID == namespace.RootNamespaceID && !IsServiceToken(te.ID):
+		case te.NamespaceID == namespace.RootNamespaceID && !IsServiceToken(te.ID) && !strings.HasPrefix(te.ID, consts.GetOAuthJwtPrefix()):
 			saltedID, err := ts.SaltID(ctx, te.ID)
 			if err != nil {
 				return err
@@ -136,6 +137,19 @@ var (
 		}
 	}
 )
+
+func validatePolicyNameSet(policies []string, fieldName string) error {
+	for _, policy := range policies {
+		if _, err := policyutil.ValidatePolicyName(policy); err != nil {
+			if fieldName == "" {
+				return fmt.Errorf("invalid policy name %q: %w", policy, err)
+			}
+			return fmt.Errorf("invalid policy name %q in %s: %w", policy, fieldName, err)
+		}
+	}
+
+	return nil
+}
 
 func (ts *TokenStore) paths() []*framework.Path {
 	commonFieldsForCreate := map[string]*framework.FieldSchema{
@@ -668,6 +682,8 @@ func (ts *TokenStore) paths() []*framework.Path {
 	tokenutil.AddTokenFieldsWithAllowList(rolesPath.Fields, []string{"token_bound_cidrs", "token_explicit_max_ttl", "token_period", "token_type", "token_no_default_policy", "token_num_uses"})
 	p = append(p, rolesPath)
 
+	p = append(p, ts.entPaths()...)
+
 	return p
 }
 
@@ -692,6 +708,11 @@ func (c *Core) LookupToken(ctx context.Context, token string) (*logical.TokenEnt
 	}
 
 	return c.tokenStore.Lookup(ctx, token)
+}
+
+// TokenStore returns the Core's token store.
+func (c *Core) TokenStore() *TokenStore {
+	return c.tokenStore
 }
 
 // CreateToken creates the given token in the core's token store.
@@ -1062,6 +1083,10 @@ func (ts *TokenStore) create(ctx context.Context, entry *logical.TokenEntry) err
 		return namespace.ErrNoNamespace
 	}
 
+	if err := validatePolicyNameSet(entry.Policies, ""); err != nil {
+		return err
+	}
+
 	entry.Policies = policyutil.SanitizePolicies(entry.Policies, policyutil.DoNotAddDefaultPolicy)
 	var createRootTokenFlag bool
 	if len(entry.Policies) == 1 && entry.Policies[0] == "root" {
@@ -1071,13 +1096,8 @@ func (ts *TokenStore) create(ctx context.Context, entry *logical.TokenEntry) err
 
 	// Validate the inline policy if it's set
 	if entry.InlinePolicy != "" {
-		// TODO (HCL_DUP_KEYS_DEPRECATION): return to ParseACLPolicy once the deprecation is done
-		_, duplicate, err := ParseACLPolicyCheckDuplicates(tokenNS, entry.InlinePolicy)
-		if err != nil {
+		if _, err := ParseACLPolicy(tokenNS, entry.InlinePolicy, WithDenySlashInTemplatedPaths(ts.core.denySlashInTemplatedPolicyPaths)); err != nil {
 			return fmt.Errorf("failed to parse inline policy for token entry: %v", err)
-		}
-		if duplicate {
-			ts.logger.Warn("HCL inline policy contains duplicate attributes, which will no longer be supported in a future version", "namespace", tokenNS.Path)
 		}
 	}
 
@@ -1117,7 +1137,7 @@ func (ts *TokenStore) create(ctx context.Context, entry *logical.TokenEntry) err
 	}
 
 	switch entry.Type {
-	case logical.TokenTypeDefault, logical.TokenTypeService, logical.TokenTypeEnt:
+	case logical.TokenTypeDefault, logical.TokenTypeService, logical.TokenTypeEnt, logical.TokenTypeSCIM:
 		// In case it was default, force to service
 		if entry.Type == logical.TokenTypeDefault {
 			entry.Type = logical.TokenTypeService
@@ -1144,29 +1164,38 @@ func (ts *TokenStore) create(ctx context.Context, entry *logical.TokenEntry) err
 				return fmt.Errorf("custom token ID cannot have the 'hvs.' prefix")
 			case strings.HasPrefix(entry.ID, consts.LegacyServiceTokenPrefix):
 				return fmt.Errorf("custom token ID cannot have the 's.' prefix")
+			case strings.HasPrefix(entry.ID, consts.GetSCIMTokenPrefix()):
+				return fmt.Errorf("custom token ID cannot have the 'scm.' prefix")
 			case strings.Contains(entry.ID, "."):
 				return fmt.Errorf("custom token ID cannot have a '.' in the value")
 			}
 		}
 
 		if !userSelectedID {
-			if !ts.core.DisableSSCTokens() {
-				entry.ID = fmt.Sprintf("hvs.%s", entry.ID)
-			} else {
-				entry.ID = fmt.Sprintf("s.%s", entry.ID)
+			switch entry.Type {
+			case logical.TokenTypeSCIM:
+				entry.ID = consts.GetSCIMTokenPrefix() + entry.ID
+			default:
+				if !ts.core.DisableSSCTokens() {
+					entry.ID = fmt.Sprintf("hvs.%s", entry.ID)
+				} else {
+					entry.ID = fmt.Sprintf("s.%s", entry.ID)
+				}
 			}
 		}
 
 		// Attach namespace ID for tokens that are not belonging to the root
-		// namespace
-		if tokenNS.ID != namespace.RootNamespaceID {
+		// namespace. JWT tokens (TokenTypeEnt) pre-compute the qualified ID in
+		// createAndStoreJwtTokenEntryJIT, so skip appending for them.
+		if tokenNS.ID != namespace.RootNamespaceID && entry.Type != logical.TokenTypeEnt {
 			entry.ID = fmt.Sprintf("%s.%s", entry.ID, tokenNS.ID)
 		}
 
 		if tokenNS.ID != namespace.RootNamespaceID ||
 			strings.HasPrefix(entry.ID, consts.ServiceTokenPrefix) ||
 			strings.HasPrefix(entry.ID, consts.LegacyServiceTokenPrefix) ||
-			strings.HasPrefix(entry.ID, consts.GetEnterpriseTokenPrefix()) {
+			strings.HasPrefix(entry.ID, consts.GetOAuthJwtPrefix()) ||
+			strings.HasPrefix(entry.ID, consts.GetSCIMTokenPrefix()) {
 			if entry.CubbyholeID == "" {
 				cubbyholeID, err := base62.Random(TokenLength)
 				if err != nil {
@@ -1177,7 +1206,9 @@ func (ts *TokenStore) create(ctx context.Context, entry *logical.TokenEntry) err
 		}
 
 		// If the user didn't specifically pick the ID, e.g. because they were
-		// sudo/root, check for collision; otherwise trust the process
+		// sudo/root, check for collision; otherwise trust the process.
+		// TokenTypeEnt always checks because the ID is prefixed after the fact
+		// so the bare random was never stored.
 		if userSelectedID || entry.Type == logical.TokenTypeEnt {
 			exist, _ := ts.lookupInternal(ctx, entry.ID, false, true)
 			if exist != nil {
@@ -1195,6 +1226,7 @@ func (ts *TokenStore) create(ctx context.Context, entry *logical.TokenEntry) err
 			return err
 		}
 		entry.ExternalID = entry.ID
+		// Service tokens wrap when SSC is enabled and the ID was auto-generated.
 		if !userSelectedID && !ts.core.DisableSSCTokens() {
 			entry.ExternalID = ts.GenerateSSCTokenID(entry.ID, logical.IndexStateFromContext(ctx), entry)
 		}
@@ -1284,22 +1316,27 @@ func (ts *TokenStore) create(ctx context.Context, entry *logical.TokenEntry) err
 // to continue operating even in the case where IDs can't be generated. Thus it logs
 // errors as opposed to throwing them.
 func (ts *TokenStore) GenerateSSCTokenID(innerToken string, walState *logical.WALState, te *logical.TokenEntry) string {
+	// Determine the correct on-wire prefix for this token type.  SCIM tokens
+	// always carry the "scm." prefix; all other service tokens use "hvs.".
+	tokenPrefix := consts.ServiceTokenPrefix
+	if te.Type == logical.TokenTypeSCIM {
+		tokenPrefix = consts.GetSCIMTokenPrefix()
+	}
+
 	// Set up the prefix prepending function. This should really only be used in
 	// the token ID generation code itself.
-	prependServicePrefix := func(externalToken string) string {
-		if strings.HasPrefix(externalToken, consts.ServiceTokenPrefix) {
-			// We didn't generate a SSC token and furthermore are attempting
-			// to regenerate a token that already has passed through
-			// GenerateSSCTokenID, as it has a prefix.
+	prependPrefix := func(externalToken string) string {
+		if strings.HasPrefix(externalToken, tokenPrefix) {
+			// Token has already passed through GenerateSSCTokenID.
 			return externalToken
 		}
-		return consts.ServiceTokenPrefix + externalToken
+		return tokenPrefix + externalToken
 	}
 
 	// If we are not using server side consistent tokens, log it and return here
 	if ts.core.DisableSSCTokens() {
 		ts.logger.Trace("server side consistent tokens are disabled")
-		return prependServicePrefix(innerToken)
+		return prependPrefix(innerToken)
 	}
 
 	// If there is no WAL state, do not throw an error as it may be a single
@@ -1311,7 +1348,7 @@ func (ts *TokenStore) GenerateSSCTokenID(innerToken string, walState *logical.WA
 		walState = &logical.WALState{}
 	}
 	if te.IsRoot() {
-		return prependServicePrefix(innerToken)
+		return prependPrefix(innerToken)
 	}
 
 	// If the token is a root token, we will always set the index and epoch to 0 so as to ensure
@@ -1325,7 +1362,7 @@ func (ts *TokenStore) GenerateSSCTokenID(innerToken string, walState *logical.WA
 	marshalledToken, err := proto.Marshal(&t)
 	if err != nil {
 		ts.logger.Error("unable to marshal token", "error", err)
-		return prependServicePrefix(innerToken)
+		return prependPrefix(innerToken)
 	}
 
 	hmac, err := ts.CalculateSignedTokenHMAC(marshalledToken)
@@ -1333,17 +1370,17 @@ func (ts *TokenStore) GenerateSSCTokenID(innerToken string, walState *logical.WA
 		// If we can't calculate the HMAC for any reason, we should log an error
 		// but still allow vault to function, using the old token instead.
 		ts.logger.Error("unable to calculate token signature", "error", err)
-		return prependServicePrefix(innerToken)
+		return prependPrefix(innerToken)
 	}
 	st := tokens.SignedToken{TokenVersion: 1, Token: marshalledToken, Hmac: hmac}
 
 	marshalledSignedToken, err := proto.Marshal(&st)
 	if err != nil {
 		ts.logger.Error("unable to marshal signed token", "error", err)
-		return prependServicePrefix(innerToken)
+		return prependPrefix(innerToken)
 	}
 	generatedSSCToken := base64.RawURLEncoding.EncodeToString(marshalledSignedToken)
-	return prependServicePrefix(generatedSSCToken)
+	return prependPrefix(generatedSSCToken)
 }
 
 func (ts *TokenStore) CalculateSignedTokenHMAC(marshalledToken []byte) ([]byte, error) {
@@ -1518,7 +1555,10 @@ func (ts *TokenStore) Lookup(ctx context.Context, id string) (*logical.TokenEntr
 	if id == "" {
 		return nil, fmt.Errorf("cannot lookup blank token")
 	}
-	normalizedID := normalizeEnterpriseTokenToID(id)
+	normalizedID, err := ts.core.normalizeJwtForLookup(ctx, id)
+	if err != nil {
+		return nil, logical.ErrInvalidRequest
+	}
 
 	// If it starts with "b." it's a batch token
 	if IsBatchToken(normalizedID) {
@@ -1650,7 +1690,7 @@ func (ts *TokenStore) lookupInternal(ctx context.Context, id string, salted, tai
 		// If possible, always use the token's namespace. If it doesn't match
 		// the request namespace, ensure the request namespace is a child
 		_, nsID := namespace.SplitIDFromString(id)
-		if nsID != "" || strings.HasPrefix(id, consts.GetEnterpriseTokenPrefix()) {
+		if nsID != "" || strings.HasPrefix(id, consts.GetOAuthJwtPrefix()) {
 			tokenNS, err := NamespaceByID(ctx, nsID, ts.core)
 			if err != nil {
 				return nil, fmt.Errorf("failed to look up namespace from the token: %w", err)
@@ -2655,6 +2695,11 @@ func (ts *TokenStore) handleUpdateRevokeAccessor(ctx context.Context, req *logic
 		return nil, namespace.ErrNoNamespace
 	}
 
+	// Reject JWTs
+	if te.Type == logical.TokenTypeEnt {
+		return logical.ErrorResponse("OAuth JWTs cannot be revoked via revoke-accessor"), logical.ErrInvalidRequest
+	}
+
 	revokeCtx := namespace.ContextWithNamespace(ts.quitContext, tokenNS)
 	leaseID, err := ts.expiration.CreateOrFetchRevocationLeaseByToken(revokeCtx, te)
 	if err != nil {
@@ -2683,9 +2728,12 @@ func (ts *TokenStore) handleCreate(ctx context.Context, req *logical.Request, d 
 
 // handleCreateCommon handles the auth/token/create path for creation of new tokens
 func (ts *TokenStore) handleCreateCommon(ctx context.Context, req *logical.Request, d *framework.FieldData, orphan bool, role *tsRoleEntry) (*logical.Response, error) {
-	normalizedClientToken := normalizeEnterpriseTokenToID(req.ClientToken)
-	if !orphan && IsEnterpriseTokenId(normalizedClientToken) {
-		return logical.ErrorResponse("enterprise tokens cannot create child tokens"), logical.ErrInvalidRequest
+	normalizedClientToken, err := ts.core.normalizeJwtForLookup(ctx, req.ClientToken)
+	if err != nil {
+		return logical.ErrorResponse("invalid token"), logical.ErrInvalidRequest
+	}
+	if !orphan && IsOAuthJwtId(normalizedClientToken) {
+		return logical.ErrorResponse("JWTs cannot create child tokens"), logical.ErrInvalidRequest
 	}
 
 	// Read the parent policy
@@ -2711,6 +2759,9 @@ func (ts *TokenStore) handleCreateCommon(ctx context.Context, req *logical.Reque
 	isSudo := ts.System().(extendedSystemView).SudoPrivilege(ctx, req.MountPoint+req.Path, req.ClientToken)
 
 	policies := d.Get("policies").([]string)
+	if err := validatePolicyNameSet(policies, "policies"); err != nil {
+		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
+	}
 
 	// If the context's namespace is different from the parent and this is an
 	// orphan token creation request, then this is an admin token generation for
@@ -2763,6 +2814,15 @@ func (ts *TokenStore) handleCreateCommon(ctx context.Context, req *logical.Reque
 	explicitMaxTTL := d.Get("explicit_max_ttl").(string)
 	numUses := d.Get("num_uses").(int)
 	period := d.Get("period").(string)
+
+	// scimClientID, scimMaxTTL, scimMaxActiveTokens, and scimUnlock are
+	// populated when type=scim is requested. scimUnlock is deferred to release
+	// the per-client cap lock after the token entry has been written.
+	var scimClientID string
+	var scimMaxTTL time.Duration
+	var scimMaxActiveTokens int32
+	var scimUnlock func()
+
 	switch tokenTypeStr {
 	case "", "service":
 	case "batch":
@@ -2792,6 +2852,11 @@ func (ts *TokenStore) handleCreateCommon(ctx context.Context, req *logical.Reque
 		}
 		tokenType = logical.TokenTypeBatch
 		renewable = false
+	case "scim":
+		// SCIM tokens are a superset of service tokens: they go through the
+		// full service-token creation path but with additional pre-issuance
+		// checks and post-issuance fixups applied below.
+		tokenType = logical.TokenTypeSCIM
 	default:
 		return logical.ErrorResponse("invalid 'token_type' value"), logical.ErrInvalidRequest
 	}
@@ -2860,6 +2925,24 @@ func (ts *TokenStore) handleCreateCommon(ctx context.Context, req *logical.Reque
 
 		// Set new entity id
 		explicitEntityID = entity.ID
+	}
+
+	// For SCIM tokens, resolve the effective entity (entity_alias takes
+	// precedence over the caller's own entity) and verify it is a registered
+	// SCIM client.  This must run after the entity_alias block above so that
+	// explicitEntityID is fully resolved.
+	if tokenType == logical.TokenTypeSCIM {
+		var scimResp *logical.Response
+		var scimErr error
+		scimClientID, scimMaxTTL, scimMaxActiveTokens, scimResp, scimErr = ts.VerifySCIMTokenCreation(ctx, req, renewable, orphan || (role != nil && role.Orphan), explicitEntityID)
+		if scimErr != nil || scimResp != nil {
+			return scimResp, scimErr
+		}
+		// SCIM tokens are orphans, so preserve the effective entity resolved during
+		// validation instead of relying on the parent token when stamping the entry.
+		if explicitEntityID == "" {
+			explicitEntityID = req.EntityID
+		}
 	}
 
 	// GetOk is used here solely to preserve the distinction between an absent/nil map and an empty map, to match the
@@ -2950,6 +3033,19 @@ func (ts *TokenStore) handleCreateCommon(ctx context.Context, req *logical.Reque
 	switch {
 	case role != nil && (len(role.AllowedPolicies) > 0 || len(role.DisallowedPolicies) > 0 ||
 		len(role.AllowedPoliciesGlob) > 0 || len(role.DisallowedPoliciesGlob) > 0):
+		if err := validatePolicyNameSet(role.AllowedPolicies, "allowed_policies"); err != nil {
+			return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
+		}
+		if err := validatePolicyNameSet(role.DisallowedPolicies, "disallowed_policies"); err != nil {
+			return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
+		}
+		if err := validatePolicyNameSet(role.AllowedPoliciesGlob, "allowed_policies_glob"); err != nil {
+			return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
+		}
+		if err := validatePolicyNameSet(role.DisallowedPoliciesGlob, "disallowed_policies_glob"); err != nil {
+			return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
+		}
+
 		// Holds the final set of policies as they get munged
 		var finalPolicies []string
 
@@ -3130,6 +3226,10 @@ func (ts *TokenStore) handleCreateCommon(ctx context.Context, req *logical.Reque
 		if role == nil {
 			te.BoundCIDRs = parent.BoundCIDRs
 		}
+	case scimClientID != "":
+		// SCIM tokens are orphans but must carry the issuing entity ID so
+		// that entity policies apply and the SCIM handler can resolve the client.
+		te.EntityID = parent.EntityID
 	}
 
 	var explicitMaxTTLToUse time.Duration
@@ -3259,13 +3359,50 @@ func (ts *TokenStore) handleCreateCommon(ctx context.Context, req *logical.Reque
 		resp.AddWarning("Supplying a custom ID for the token uses the weaker SHA1 hashing instead of the more secure SHA2-256 HMAC for token obfuscation. SHA1 hashed tokens on the wire leads to less secure lookups.")
 	}
 
-	// check if we are perfStandby, and if so forward the service token
+	// For SCIM tokens, stamp the client ID, creation path, and per-client TTL
+	// ceiling onto the entry before create() is called so that the SCIM branch
+	// of create()'s type switch sees them.
+	if scimClientID != "" {
+		// Path format: auth/token/create/scim/<clientID>[/<role>[/<pathSuffix>]]
+		te.Path = "auth/token/create/scim/" + scimClientID
+		if role != nil {
+			te.Path = te.Path + "/" + role.Name
+			if role.PathSuffix != "" {
+				te.Path = te.Path + "/" + role.PathSuffix
+			}
+		}
+
+		if te.InternalMeta == nil {
+			te.InternalMeta = make(map[string]string)
+		}
+		te.InternalMeta["scim_client_id"] = scimClientID
+
+		// Apply the per-client max_token_ttl ceiling.
+		if scimMaxTTL > 0 && te.TTL > scimMaxTTL {
+			te.TTL = scimMaxTTL
+		}
+	}
+
+	// For SCIM tokens, acquire the per-client cap lock immediately before
+	// issuing. The lock is held until create() returns, making the
+	// count-then-issue window atomic. defer guarantees release on all paths.
+	if scimClientID != "" {
+		var slotResp *logical.Response
+		var slotErr error
+		scimUnlock, slotResp, slotErr = ts.AcquireSCIMTokenSlot(ctx, req, scimClientID, scimMaxActiveTokens)
+		defer scimUnlock()
+		if slotErr != nil || slotResp != nil {
+			return slotResp, slotErr
+		}
+	}
+
+	// check if we are perfStandby, and if so forward the service or SCIM token
 	// creation to the active node
 	var roleName string
 	if role != nil {
 		roleName = role.Name
 	}
-	if te.Type == logical.TokenTypeService && ts.core.perfStandby {
+	if isServiceTokenDerivative(te) && ts.core.perfStandby {
 		forwardedTokenEntry, err := forwardCreateTokenRegisterAuth(ctx, ts.core, &te, roleName, renewable, periodToUse, explicitMaxTTLToUse)
 		if err != nil {
 			return logical.ErrorResponse(err.Error()), ErrInternalError
@@ -3313,8 +3450,8 @@ func (ts *TokenStore) handleCreateCommon(ctx context.Context, req *logical.Reque
 	}
 
 	// We have registered the auth at this point if the token is of service
-	// type and core is perfStandby.
-	if te.Type == logical.TokenTypeService && ts.core.perfStandby && te.ExternalID != "" {
+	// or SCIM type and core is perfStandby.
+	if isServiceTokenDerivative(te) && ts.core.perfStandby && te.ExternalID != "" {
 		resp.Auth.ClientToken = te.ExternalID
 	}
 
@@ -3335,6 +3472,9 @@ func (ts *TokenStore) handleCreateCommon(ctx context.Context, req *logical.Reque
 // in a way that revokes all child tokens. Normally, using sys/revoke/leaseID will revoke
 // the token and all children anyways, but that is only available when there is a lease.
 func (ts *TokenStore) handleRevokeSelf(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	if IsOAuthJwt(req.ClientToken) || IsOAuthJwtId(req.ClientToken) {
+		return logical.ErrorResponse("OAuth JWTs cannot be revoked via revoke-self. Use auth/token/revoke or auth/token/revoke-oauth"), logical.ErrInvalidRequest
+	}
 	return ts.revokeCommon(ctx, req, data, req.ClientToken)
 }
 
@@ -3347,6 +3487,15 @@ func (ts *TokenStore) handleRevokeTree(ctx context.Context, req *logical.Request
 		return logical.ErrorResponse("missing token ID"), logical.ErrInvalidRequest
 	}
 
+	// Prevent revocation of internal representation (JWT ID)
+	if IsOAuthJwtId(id) {
+		return logical.ErrorResponse(ErrFullJWTRequired.Error()), logical.ErrInvalidRequest
+	}
+
+	if IsOAuthJwt(id) {
+		return ts.revokeCommonJWT(ctx, req, id)
+	}
+
 	if resp, err := ts.revokeCommon(ctx, req, data, id); resp != nil || err != nil {
 		return resp, err
 	}
@@ -3355,10 +3504,6 @@ func (ts *TokenStore) handleRevokeTree(ctx context.Context, req *logical.Request
 }
 
 func (ts *TokenStore) revokeCommon(ctx context.Context, req *logical.Request, data *framework.FieldData, id string) (*logical.Response, error) {
-	normalizedID := normalizeEnterpriseTokenToID(id)
-	if IsEnterpriseTokenId(normalizedID) {
-		return logical.ErrorResponse("cannot revoke ent token"), nil
-	}
 	te, err := ts.Lookup(ctx, id)
 	if err != nil {
 		return nil, err
@@ -3403,9 +3548,15 @@ func (ts *TokenStore) handleRevokeOrphan(ctx context.Context, req *logical.Reque
 		return logical.ErrorResponse("missing token ID"), logical.ErrInvalidRequest
 	}
 
-	normalizedID := normalizeEnterpriseTokenToID(id)
-	if IsEnterpriseTokenId(normalizedID) {
-		return logical.ErrorResponse("enterprise token cannot be revoked"), nil
+	// Prevent revocation of internal representation (JWT ID)
+	if IsOAuthJwtId(id) {
+		return logical.ErrorResponse(ErrFullJWTRequired.Error()), logical.ErrInvalidRequest
+	}
+
+	// Because JWT Tokens are unable to create child tokens, there are no
+	// orphans to worry about. Delegate to the shared JWT revocation path.
+	if IsOAuthJwt(id) {
+		return ts.revokeCommonJWT(ctx, req, id)
 	}
 
 	// Do a lookup. Among other things, that will ensure that this is either
@@ -3445,20 +3596,12 @@ func (ts *TokenStore) handleLookup(ctx context.Context, req *logical.Request, da
 	if id == "" {
 		return logical.ErrorResponse("missing token ID"), logical.ErrInvalidRequest
 	}
-	if IsEnterpriseToken(id) {
-		// If the token specified in the request body is different from the caller's
-		// token, resolve the token ID based on the body token's claims (JTI) instead
-		// of req.EnterpriseTokenMetadata, otherwise we may silently return the caller's
-		// own token entry or fail for non-Enterprise token callers.
-		if id == req.ClientToken {
-			id = getEnterpriseTokenId(req.EnterpriseTokenMetadata)
-		} else {
-			resolvedID, err := resolveEnterpriseTokenIDForLookup(id)
-			if err != nil {
-				return logical.ErrorResponse("invalid token"), logical.ErrInvalidRequest
-			}
-			id = resolvedID
+	if IsOAuthJwt(id) {
+		resolvedID, err := ts.core.normalizeJwtForLookup(ctx, id)
+		if err != nil {
+			return logical.ErrorResponse("invalid token"), logical.ErrInvalidRequest
 		}
+		id = resolvedID
 	}
 	lock := locksutil.LockForKey(ts.tokenLocks, id)
 	lock.RLock()
@@ -3571,9 +3714,12 @@ func (ts *TokenStore) handleRenew(ctx context.Context, req *logical.Request, dat
 	if id == "" {
 		return logical.ErrorResponse("missing token ID"), logical.ErrInvalidRequest
 	}
-	normalizedID := normalizeEnterpriseTokenToID(id)
-	if IsEnterpriseTokenId(normalizedID) {
-		return logical.ErrorResponse("enterprise tokens cannot be renewed"), nil
+	normalizedID, err := ts.core.normalizeJwtForLookup(ctx, id)
+	if err != nil {
+		return logical.ErrorResponse("invalid token"), logical.ErrInvalidRequest
+	}
+	if IsOAuthJwtId(normalizedID) {
+		return logical.ErrorResponse("JWTs cannot be renewed"), nil
 	}
 	incrementRaw := data.Get("increment").(int)
 
@@ -3803,7 +3949,8 @@ func (ts *TokenStore) tokenStoreRoleCreateUpdate(ctx context.Context, req *logic
 				if !matched {
 					return logical.ErrorResponse(fmt.Sprintf(
 						"given role path suffix contains invalid characters; must match %s",
-						pathSuffixSanitize.String())), nil
+						pathSuffixSanitize.String(),
+					)), nil
 				}
 			}
 			entry.PathSuffix = pathSuffix
@@ -3817,30 +3964,62 @@ func (ts *TokenStore) tokenStoreRoleCreateUpdate(ctx context.Context, req *logic
 
 		allowedPoliciesRaw, ok := data.GetOk("allowed_policies")
 		if ok {
-			entry.AllowedPolicies = policyutil.SanitizePolicies(allowedPoliciesRaw.([]string), policyutil.DoNotAddDefaultPolicy)
+			allowedPolicies := allowedPoliciesRaw.([]string)
+			if err := validatePolicyNameSet(allowedPolicies, "allowed_policies"); err != nil {
+				return logical.ErrorResponse(err.Error()), nil
+			}
+			entry.AllowedPolicies = policyutil.SanitizePolicies(allowedPolicies, policyutil.DoNotAddDefaultPolicy)
 		} else if req.Operation == logical.CreateOperation {
-			entry.AllowedPolicies = policyutil.SanitizePolicies(data.Get("allowed_policies").([]string), policyutil.DoNotAddDefaultPolicy)
+			allowedPolicies := data.Get("allowed_policies").([]string)
+			if err := validatePolicyNameSet(allowedPolicies, "allowed_policies"); err != nil {
+				return logical.ErrorResponse(err.Error()), nil
+			}
+			entry.AllowedPolicies = policyutil.SanitizePolicies(allowedPolicies, policyutil.DoNotAddDefaultPolicy)
 		}
 
 		disallowedPoliciesRaw, ok := data.GetOk("disallowed_policies")
 		if ok {
-			entry.DisallowedPolicies = strutil.RemoveDuplicates(disallowedPoliciesRaw.([]string), true)
+			disallowedPolicies := disallowedPoliciesRaw.([]string)
+			if err := validatePolicyNameSet(disallowedPolicies, "disallowed_policies"); err != nil {
+				return logical.ErrorResponse(err.Error()), nil
+			}
+			entry.DisallowedPolicies = strutil.RemoveDuplicates(disallowedPolicies, true)
 		} else if req.Operation == logical.CreateOperation {
-			entry.DisallowedPolicies = strutil.RemoveDuplicates(data.Get("disallowed_policies").([]string), true)
+			disallowedPolicies := data.Get("disallowed_policies").([]string)
+			if err := validatePolicyNameSet(disallowedPolicies, "disallowed_policies"); err != nil {
+				return logical.ErrorResponse(err.Error()), nil
+			}
+			entry.DisallowedPolicies = strutil.RemoveDuplicates(disallowedPolicies, true)
 		}
 
 		allowedPoliciesGlobRaw, ok := data.GetOk("allowed_policies_glob")
 		if ok {
-			entry.AllowedPoliciesGlob = policyutil.SanitizePolicies(allowedPoliciesGlobRaw.([]string), policyutil.DoNotAddDefaultPolicy)
+			allowedPoliciesGlob := allowedPoliciesGlobRaw.([]string)
+			if err := validatePolicyNameSet(allowedPoliciesGlob, "allowed_policies_glob"); err != nil {
+				return logical.ErrorResponse(err.Error()), nil
+			}
+			entry.AllowedPoliciesGlob = policyutil.SanitizePolicies(allowedPoliciesGlob, policyutil.DoNotAddDefaultPolicy)
 		} else if req.Operation == logical.CreateOperation {
-			entry.AllowedPoliciesGlob = policyutil.SanitizePolicies(data.Get("allowed_policies_glob").([]string), policyutil.DoNotAddDefaultPolicy)
+			allowedPoliciesGlob := data.Get("allowed_policies_glob").([]string)
+			if err := validatePolicyNameSet(allowedPoliciesGlob, "allowed_policies_glob"); err != nil {
+				return logical.ErrorResponse(err.Error()), nil
+			}
+			entry.AllowedPoliciesGlob = policyutil.SanitizePolicies(allowedPoliciesGlob, policyutil.DoNotAddDefaultPolicy)
 		}
 
 		disallowedPoliciesGlobRaw, ok := data.GetOk("disallowed_policies_glob")
 		if ok {
-			entry.DisallowedPoliciesGlob = strutil.RemoveDuplicates(disallowedPoliciesGlobRaw.([]string), true)
+			disallowedPoliciesGlob := disallowedPoliciesGlobRaw.([]string)
+			if err := validatePolicyNameSet(disallowedPoliciesGlob, "disallowed_policies_glob"); err != nil {
+				return logical.ErrorResponse(err.Error()), nil
+			}
+			entry.DisallowedPoliciesGlob = strutil.RemoveDuplicates(disallowedPoliciesGlob, true)
 		} else if req.Operation == logical.CreateOperation {
-			entry.DisallowedPoliciesGlob = strutil.RemoveDuplicates(data.Get("disallowed_policies_glob").([]string), true)
+			disallowedPoliciesGlob := data.Get("disallowed_policies_glob").([]string)
+			if err := validatePolicyNameSet(disallowedPoliciesGlob, "disallowed_policies_glob"); err != nil {
+				return logical.ErrorResponse(err.Error()), nil
+			}
+			entry.DisallowedPoliciesGlob = strutil.RemoveDuplicates(disallowedPoliciesGlob, true)
 		}
 	}
 
@@ -3957,7 +4136,8 @@ func (ts *TokenStore) tokenStoreRoleCreateUpdate(ctx context.Context, req *logic
 			}
 			resp.AddWarning(fmt.Sprintf(
 				"Given explicit max TTL of %d is greater than system/mount allowed value of %d seconds; until this is fixed attempting to create tokens against this role will result in an error",
-				int64(finalExplicitMaxTTL.Seconds()), int64(sysView.MaxLeaseTTL().Seconds())))
+				int64(finalExplicitMaxTTL.Seconds()), int64(sysView.MaxLeaseTTL().Seconds()),
+			))
 		}
 	}
 
@@ -4297,6 +4477,11 @@ func (ts *TokenStore) gaugeCollectorByMethod(ctx context.Context) ([]metricsutil
 	return flattenedResults, nil
 }
 
+// Check if the token should be treated as a service token during auth handling.
+func isServiceTokenDerivative(te logical.TokenEntry) bool {
+	return te.Type == logical.TokenTypeService || te.Type == logical.TokenTypeSCIM
+}
+
 const (
 	tokenTidyHelp = `
 This endpoint performs cleanup tasks that can be run if certain error
@@ -4323,6 +4508,7 @@ as revocation of tokens. The tokens are renewable if associated with a lease.`
 	tokenRevokeAccessorHelp  = `This endpoint will delete the token associated with the accessor and all of its child tokens.`
 	tokenRevokeHelp          = `This endpoint will delete the given token and all of its child tokens.`
 	tokenRevokeSelfHelp      = `This endpoint will delete the token used to call it and all of its child tokens.`
+	tokenRevokeOAuthHelp     = `This endpoint revokes an external OAuth token identified by its issuer and unique ID.`
 	tokenRevokeOrphanHelp    = `This endpoint will delete the token and orphan its child tokens.`
 	tokenRenewHelp           = `This endpoint will renew the given token and prevent expiration.`
 	tokenRenewSelfHelp       = `This endpoint will renew the token used to call it and prevent expiration.`

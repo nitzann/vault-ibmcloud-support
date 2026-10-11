@@ -38,6 +38,13 @@ on:
         description: A comma-separated list of additional build tags to consider satisfied during the build.
         required: false
         type: string
+      modules:
+        description: |
+          Space-separated Go module directories, relative to the repository root, whose packages
+          are tested. When empty, every module in go.work is tested.
+        required: false
+        default: ''
+        type: string
       name:
         description: |
           A unique identifier to use for labeling artifacts and workflows. It is commonly used to
@@ -84,6 +91,11 @@ on:
         required: false
         default: ${{ github.ref }}
         type: string
+      changed-files:
+        description: JSON payload containing changed file paths from setup workflow.
+        required: false
+        default: '{}'
+        type: string
     outputs:
       data-race-output:
         description: A textual output of any data race detector failures
@@ -96,7 +108,12 @@ env: ${{ fromJSON(inputs.env-vars) }}
 
 jobs:
   test-matrix:
-    permissions: write-all # vault-auth
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      issues: read
+      pull-requests: write
     runs-on: ${{ fromJSON(inputs.runs-on-small) }}
     outputs:
       is-ent-branch: ${{ steps.global-metadata.outputs.is-ent-branch }}
@@ -105,7 +122,7 @@ jobs:
       matrix: ${{ steps.build.outputs.matrix }}
       matrix_ids: ${{ steps.build.outputs.matrix_ids }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.checkout-ref }}
       - uses: ./.github/actions/metadata
@@ -119,7 +136,7 @@ jobs:
       - if: steps.global-metadata.outputs.is-ent-repo == 'true'
         name: Fetch Secrets
         id: secrets
-        uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3.4.0
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0
         with:
           url: ${{ steps.vault-auth.outputs.addr }}
           caCertificate: ${{ steps.vault-auth.outputs.ca_certificate }}
@@ -127,27 +144,25 @@ jobs:
           secrets: |
             kv/data/github/${{ github.repository }}/datadog-ci DATADOG_API_KEY;
             kv/data/github/${{ github.repository }}/github-token username-and-token | github-token;
+            kv/data/github/${{ github.repository }}/github-token token | ELEVATED_GITHUB_TOKEN;
             kv/data/github/${{ github.repository }}/license license_1 | VAULT_LICENSE_CI;
             kv/data/github/${{ github.repository }}/license license_2 | VAULT_LICENSE_2;
             kv/data/github/${{ github.repository }}/ibm-license license_1 | VAULT_LICENSE_IBM;
             kv/data/github/${{ github.repository }}/ibm-license license_2 | VAULT_LICENSE_IBM_2;
-      - if: steps.global-metadata.outputs.is-ent-repo == 'true'
-        name: Setup Git configuration (private)
-        id: setup-git-private
-        run: |
-          git config --global url."https://${{ steps.secrets.outputs.github-token }}@github.com".insteadOf https://github.com
-      - if: steps.global-metadata.outputs.is-ent-repo != 'true'
-        name: Setup Git configuration (public)
-        id: setup-git-public
-        run: |
-          git config --global url."https://${{ secrets.ELEVATED_GITHUB_TOKEN}}@github.com".insteadOf https://github.com
       - uses: ./.github/actions/set-up-go
         with:
-          github-token: ${{ steps.global-metadata.outputs.is-ent-repo == 'true' && steps.secrets.outputs.github-token || secrets.ELEVATED_GITHUB_TOKEN }}
+          github-token: ${{ steps.global-metadata.outputs.is-ent-repo != 'true' && secrets.ELEVATED_GITHUB_TOKEN || steps.secrets.outputs.github-token }}
+          cache: fetch-only # setup is responsible for managing the module cache
       - uses: ./.github/actions/install-tools # for gotestsum
+        with:
+          cache: fetch-only
+      # Every matrix variant needs the pipeline tool, including testonly, to group packages by module.
+      - uses: ./.github/actions/set-up-pipeline
+        with:
+          github-token: ${{ steps.global-metadata.outputs.is-ent-repo != 'true' && secrets.ELEVATED_GITHUB_TOKEN || steps.secrets.outputs.ELEVATED_GITHUB_TOKEN }}
       - run: mkdir -p ${{ steps.local-metadata.outputs.go-test-dir }}
       - if: inputs.test-timing-cache-restore || inputs.test-timing-cache-save
-        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.local-metadata.outputs.go-test-dir }}
           key: ${{ inputs.test-timing-cache-key }}-${{ github.run_number }}
@@ -163,21 +178,37 @@ jobs:
             jq . "$file" || rm "$file"
           ' shell {} \; > /dev/null 2>&1
       - if: ${{ !inputs.testonly }}
+        name: List Go test packages
+        env:
+          # tools/pipeline needs GOPRIVATE on every branch. This step only lists packages.
+          GOPRIVATE: github.com/hashicorp/*
+          GO_TAGS: ${{ inputs.go-tags }}
+          MODULES: ${{ inputs.modules }}
+        run: |
+          set -euo pipefail
+          module_flags=()
+          # shellcheck disable=SC2086 # MODULES is a space-separated list
+          for module in $MODULES; do
+            module_flags+=(--module "$module")
+          done
+          pipeline go list packages ${{ runner.debug && '--log debug' || '' }} \
+            --format json --tags "$GO_TAGS" "${module_flags[@]}" |
+            jq -r '.modules[].packages[]' > packages.txt
+          wc -l packages.txt
+      - if: ${{ !inputs.testonly }}
         name: Build matrix excluding binary, integration, and testonly tests
         id: build-non-binary
-        env:
-          GOPRIVATE: github.com/hashicorp/*
         run: |
           # testonly tests need additional build tag though let's exclude them anyway for clarity
           (
-            make all-packages | grep -v "_binary\|testonly\|vault/integ\|vault/external_tests/blackbox" | gotestsum tool ci-matrix --debug \
+            grep -v "_binary\|testonly\|vault/integ\|vault/external_tests/blackbox" packages.txt | gotestsum tool ci-matrix --debug \
               --partitions "${{ inputs.total-runners }}" \
               --timing-files '${{ steps.local-metadata.outputs.go-test-dir }}/*.json' > matrix.json
           )
       - if: ${{ inputs.testonly }}
         name: Build matrix for tests tagged with testonly
         env:
-          GOPRIVATE: github.com/hashicorp/*
+          GOPRIVATE: ${{ steps.global-metadata.outputs.is-ent-branch == 'true' && 'github.com/hashicorp/*' || '' }}
         run: |
           set -exo pipefail
           # enable glob expansion
@@ -185,7 +216,7 @@ jobs:
           # testonly tagged tests need an additional tag to be included
           # also running some extra tests for sanity checking with the testonly build tag
           (
-            go list -tags=testonly ./vault/external_tests/{kv,token,*replication-perf*,*testonly*,*verify*} ./command/*testonly* ./vault/ | gotestsum tool ci-matrix --debug \
+            go list -tags="${{inputs.go-tags}}" ./vault/external_tests/{kv,token,*replication-perf*,*testonly*} ./command/*testonly* ./vault/ | gotestsum tool ci-matrix --debug \
               --partitions "${{ inputs.total-runners }}" \
               --timing-files '${{ steps.local-metadata.outputs.go-test-dir }}/*.json' > matrix.json
           )
@@ -195,7 +226,7 @@ jobs:
         name: Capture list of binary tests
         id: list-binary-tests
         run: |
-          LIST="$(make all-packages | grep "_binary" | xargs)"
+          LIST="$(grep "_binary" packages.txt | xargs || true)"
           echo "list=$LIST" >> "$GITHUB_OUTPUT"
       - name: Build complete matrix
         id: build
@@ -213,6 +244,16 @@ jobs:
               }]' matrix.json > new-matrix.json
               matrix_file="new-matrix.json"
             fi
+            # Drop partitions that ci-matrix leaves empty when there are fewer packages than partitions.
+            jq '.include |= map(select(.packages != ""))' "$matrix_file" > pruned-matrix.json
+            # Group each partition's packages by Go module so runners can test each module from its own
+            # directory with GOWORK=off.
+            jq -c '.include[]' pruned-matrix.json | while read -r partition; do
+              modules=$(jq -r '.packages' <<< "$partition" | tr ' ' '\n' |
+                pipeline go group packages --format json - | jq -c '.modules')
+              jq -c --argjson modules "$modules" '. + {modules: $modules}' <<< "$partition"
+            done | jq -s '{include: .}' > grouped-matrix.json
+            matrix_file="grouped-matrix.json"
             # convert the json to a map keyed by id
             (
               echo -n "matrix="
@@ -231,25 +272,49 @@ jobs:
     permissions:
       actions: read
       contents: read
-      id-token: write  # Note: this permission is explicitly required for Vault auth
+      id-token: write
+      issues: read
+      pull-requests: write
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     strategy:
       fail-fast: false
       matrix:
         id: ${{ fromJSON(needs.test-matrix.outputs.matrix_ids) }}
     env:
-      GOPRIVATE: github.com/hashicorp/*
+      GOPRIVATE: ${{ needs.test-matrix.outputs.is-ent-branch == 'true' && 'github.com/hashicorp/*' || '' }}
+      # Skip go generate. Generated code should be checked in.
+      SKIP_GEN: "1"
       TIMEOUT_IN_MINUTES: ${{ inputs.timeout-minutes }}
     outputs:
       go-test-results-download-pattern: ${{ steps.metadata.outputs.go-test-results-download-pattern }}
       data-race-log-download-pattern: ${{ steps.metadata.outputs.data-race-log-download-pattern }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.checkout-ref }}
+      - if: needs.test-matrix.outputs.is-ent-repo == 'true'
+        name: Authenticate to Vault
+        id: vault-auth
+        run: vault-auth
+      - if: needs.test-matrix.outputs.is-ent-repo == 'true'
+        name: Fetch Secrets
+        id: vault-secrets
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0
+        with:
+          url: ${{ steps.vault-auth.outputs.addr }}
+          caCertificate: ${{ steps.vault-auth.outputs.ca_certificate }}
+          token: ${{ steps.vault-auth.outputs.token }}
+          secrets: |
+            kv/data/github/${{ github.repository }}/datadog-ci DATADOG_API_KEY;
+            kv/data/github/${{ github.repository }}/github-token username-and-token | github-token;
+            kv/data/github/${{ github.repository }}/license license_1 | VAULT_LICENSE_CI;
+            kv/data/github/${{ github.repository }}/license license_2 | VAULT_LICENSE_2;
+            kv/data/github/${{ github.repository }}/ibm-license license_1 | VAULT_LICENSE_IBM;
+            kv/data/github/${{ github.repository }}/ibm-license license_2 | VAULT_LICENSE_IBM_2;
       - uses: ./.github/actions/set-up-go
         with:
-          github-token: ${{ secrets.ELEVATED_GITHUB_TOKEN }}
+          github-token: ${{ needs.test-matrix.outputs.is-ent-repo != 'true' && secrets.ELEVATED_GITHUB_TOKEN || steps.vault-secrets.outputs.github-token }}
+          cache: fetch-only
       - id: metadata
         name: Set up metadata
         run: |
@@ -266,17 +331,18 @@ jobs:
           go_test_dir_absolute="$(pwd)/${go_test_dir}"                                  # /home/runner/work/vault/vault/test-results/go-test
           go_test_log_dir="${go_test_dir}/logs"                                         # test-results/go-test/logs
           go_test_log_dir_absolute="${go_test_dir_absolute}/logs"                       # /home/runner/work/vault/vault/test-results/go-test/logs
-          go_test_log_archive_name="test-logs-${name}.tar"                              # test-logs-testonly-main-1.tar
-          go_test_results_upload_key="${test_results_dir}-${name}"                      # test-results/go-test-testonly-main-1
+          # Artifact names are truncated to ensure prefix + variable + suffix ≤ 235 chars (GitHub limit: 255, minus compression suffix buffer)
+          go_test_log_archive_name="test-logs-${name:0:221}.tar"                              # test-logs-testonly-main-1.tar
+          go_test_results_upload_key="${test_results_dir}-${name:0:213}"                      # test-results/go-test-testonly-main-1
           go_test_results_download_pattern="${test_results_dir}-${{ inputs.name }}-*"   # test-results/go-test-testonly-main-*
           gotestsum_results_prefix="results"                                            # results
-          gotestsum_junitfile=${go_test_dir}/${gotestsum_results_prefix}-${name}.xml    # test-results/go-test/results-testonly-main-1.xml
-          gotestsum_jsonfile=${go_test_dir}/${gotestsum_results_prefix}-${name}.json    # test-results/go-test/results-testonly-main-1.json
-          gotestsum_timing_events=failure-summary-${name}.json                          # failure-summary-testonly-main-1.json
-          failure_summary_file_name="failure-summary-${name}.md"                        # failure-summary-testonly-main-1.md
+          gotestsum_junitfile="${go_test_dir}/${gotestsum_results_prefix}-${name:0:201}.xml"    # test-results/go-test/results-testonly-main-1.xml
+          gotestsum_jsonfile="${go_test_dir}/${gotestsum_results_prefix}-${name:0:200}.json"    # test-results/go-test/results-testonly-main-1.json
+          gotestsum_timing_events="failure-summary-${name:0:214}.json"                          # failure-summary-testonly-main-1.json
+          failure_summary_file_name="failure-summary-${name:0:216}.md"                        # failure-summary-testonly-main-1.md
           data_race_log_file="data-race.log"                                            # data-race.log
           data_race_log_download_pattern="data-race-${{ inputs.name }}*.log"            # data-race-testonly-main-*.log
-          data_race_log_upload_key="data-race-${name}.log"                              # data-race-testonly-main-1.log
+          data_race_log_upload_key="data-race-${name:0:221}.log"                              # data-race-testonly-main-1.log
           {
             echo "name=${name}"
             echo "failure-summary-file-name=${failure_summary_file_name}"
@@ -294,53 +360,43 @@ jobs:
             echo "gotestsum-results-prefix=${gotestsum_results_prefix}"
             echo "gotestsum-timing-events=${gotestsum_timing_events}"
           } | tee -a "$GITHUB_OUTPUT"
-      - if: needs.test-matrix.outputs.is-ent-repo == 'true'
-        name: Authenticate to Vault
-        id: vault-auth
-        run: vault-auth
-      - if: needs.test-matrix.outputs.is-ent-repo == 'true'
-        name: Fetch Secrets
-        id: secrets
-        uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3.4.0
-        with:
-          url: ${{ steps.vault-auth.outputs.addr }}
-          caCertificate: ${{ steps.vault-auth.outputs.ca_certificate }}
-          token: ${{ steps.vault-auth.outputs.token }}
-          secrets: |
-            kv/data/github/${{ github.repository }}/datadog-ci DATADOG_API_KEY;
-            kv/data/github/${{ github.repository }}/github-token username-and-token | github-token;
-            kv/data/github/${{ github.repository }}/license license_1 | VAULT_LICENSE_CI;
-            kv/data/github/${{ github.repository }}/license license_2 | VAULT_LICENSE_2;
-            kv/data/github/${{ github.repository }}/ibm-license license_1 | VAULT_LICENSE_IBM;
-            kv/data/github/${{ github.repository }}/ibm-license license_2 | VAULT_LICENSE_IBM_2;
-      - if: needs.test-matrix.outputs.is-ent-repo == 'true'
-        id: setup-git-private
-        name: Setup Git configuration (private)
-        run: |
-          git config --global url."https://${{ steps.secrets.outputs.github-token }}@github.com".insteadOf https://github.com
-      - if: needs.test-matrix.outputs.is-ent-repo != 'true'
-        id: setup-git-public
-        name: Setup Git configuration (public)
-        run: |
-          git config --global url."https://${{ secrets.ELEVATED_GITHUB_TOKEN}}@github.com".insteadOf https://github.com
       - uses: ./.github/actions/install-tools
+        with:
+          cache: fetch-only
+      - if: github.repository == 'hashicorp/vault-enterprise'
+        name: Configure Instana for test tracing
+        continue-on-error: true
+        env:
+          INSTANA_AGENT_KEY: ${{ secrets.INSTANA_AGENT_KEY }}
+          INSTANA_ENDPOINT_URL: ${{ secrets.INSTANA_ENDPOINT_URL }}
+        run: |
+          # Export Instana environment variables for test execution
+          # These will be available to tests that import the observability package
+          # Note: Secrets are automatically masked in GitHub Actions logs
+          if [ -n "${INSTANA_AGENT_KEY}" ]; then
+            echo "INSTANA_AGENT_KEY=${INSTANA_AGENT_KEY}" >> "$GITHUB_ENV"
+            echo "::add-mask::${INSTANA_AGENT_KEY}"
+          fi
+          if [ -n "${INSTANA_ENDPOINT_URL}" ]; then
+            echo "INSTANA_ENDPOINT_URL=${INSTANA_ENDPOINT_URL}" >> "$GITHUB_ENV"
+          fi
       - if: inputs.binary-tests && matrix.id == inputs.total-runners && needs.test-matrix.outputs.is-ent-branch == 'true'
         name: Build Vault HSM binary for tests
         env:
-          GOPRIVATE: github.com/hashicorp/*
+          GOPRIVATE: ${{ needs.test-matrix.outputs.is-ent-branch == 'true' && 'github.com/hashicorp/*' || '' }}
         run: |
           set -exo pipefail
-          time make prep enthsmdev
+          time make enthsmdev
           # The subsequent build of vault will blow away the bin folder
           mv bin/vault vault-hsm-binary
       - if: inputs.binary-tests && matrix.id == inputs.total-runners
         name: Build dev binary for binary tests
         # The dev mode binary has to exist for binary tests that are dispatched on the last runner.
         env:
-          GOPRIVATE: github.com/hashicorp/*
+          GOPRIVATE: ${{ needs.test-matrix.outputs.is-ent-branch == 'true' && 'github.com/hashicorp/*' || '' }}
         run: |
           set -exo pipefail
-          time make prep dev
+          time make dev
           mv bin/vault vault-binary
       - if: inputs.binary-tests && matrix.id == inputs.total-runners
         id: build-docker-image
@@ -367,47 +423,28 @@ jobs:
           fi
       - if: needs.test-matrix.outputs.is-ent-repo != 'true'
         # Enterprise repo runners do not allow sudo, so can't install gVisor there yet.
-        name: Install gVisor
+        name: Set up gVisor
+        uses: ./.github/actions/set-up-gvisor
+      - name: Install swtpm
         run: |
-          (
-            set -e
-            ARCH="$(uname -m)"
-            URL="https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}"
-            wget --quiet "${URL}/runsc" "${URL}/runsc.sha512" \
-              "${URL}/containerd-shim-runsc-v1" "${URL}/containerd-shim-runsc-v1.sha512"
-            sha512sum -c runsc.sha512 \
-              -c containerd-shim-runsc-v1.sha512
-            rm -f -- *.sha512
-            chmod a+rx runsc containerd-shim-runsc-v1
-            sudo mv runsc containerd-shim-runsc-v1 /usr/local/bin
-          )
-          sudo tee /etc/docker/daemon.json <<EOF
-          {
-            "runtimes": {
-              "runsc": {
-                "path": "/usr/local/bin/runsc",
-                "runtimeArgs": [
-                  "--host-uds=create"
-                ]
-              }
-            }
-          }
-          EOF
-          sudo systemctl reload docker
+          sudo apt-get update
+          sudo apt-get install -y swtpm swtpm-tools
       - id: run-go-tests
         name: Run Go tests
         timeout-minutes: ${{ fromJSON(env.TIMEOUT_IN_MINUTES) }}
         env:
           COMMIT_SHA: ${{ github.sha }}
+          # Pass this runner's modules through the environment. Inlining JSON into the script leaves
+          # it unquoted, and bash brace-expands it. Only this runner's slice keeps the variable well
+          # under Linux's 128 KiB limit for one environment string.
+          MODULES: ${{ toJSON(fromJSON(needs.test-matrix.outputs.matrix)[matrix.id].modules) }}
+          GOTESTSUM_JSONFILE: ${{ steps.metadata.outputs.gotestsum-jsonfile }}
+          GOTESTSUM_JUNITFILE: ${{ steps.metadata.outputs.gotestsum-junitfile }}
+          GOTESTSUM_TIMING_EVENTS: ${{ steps.metadata.outputs.gotestsum-timing-events }}
         run: |
           set -exo pipefail
 
-          # Build the dynamically generated source files.
-          make prep
-
-          packages=$(echo "${{ toJSON(needs.test-matrix.outputs.matrix) }}" | jq -c -r --arg id "${{ matrix.id }}" '.[$id] | .packages')
-
-          if [ -z "$packages" ]; then
+          if [ "$(jq 'length' <<< "$MODULES")" -eq 0 ]; then
             echo "no test packages to run"
             exit 1
           fi
@@ -459,20 +496,96 @@ jobs:
           VAULT_TEST_LOG_DIR='${{ steps.metadata.outputs.go-test-log-dir-absolute }}'
           export VAULT_TEST_LOG_DIR
           mkdir -p "$VAULT_TEST_LOG_DIR"
-          # shellcheck disable=SC2086 # can't quote RERUN_FAILS
-          GOARCH=${{ inputs.go-arch }} VAULT_ADDR='' \
-            gotestsum --format=short-verbose \
-              --junitfile '${{ steps.metadata.outputs.gotestsum-junitfile }}' \
-              --jsonfile '${{ steps.metadata.outputs.gotestsum-jsonfile }}' \
-              --jsonfile-timing-events '${{ steps.metadata.outputs.gotestsum-timing-events }}' \
-              $RERUN_FAILS \
-              --packages "$packages" \
-              -- \
-              $package_parallelism \
-              -tags "${{ inputs.go-tags }}" \
-              -timeout=${{ inputs.go-test-timeout }} \
-              -parallel="$test_parallelism" \
-              ${{ inputs.extra-flags }} \
+          unset VAULT_ADDR
+          export GOWORK=off
+          repo_root=$(pwd)
+          jsonfile="${repo_root}/${GOTESTSUM_JSONFILE}"
+          timing_events="${repo_root}/${GOTESTSUM_TIMING_EVENTS}"
+          junit_base="${repo_root}/${GOTESTSUM_JUNITFILE}"
+          : > "$jsonfile"
+          : > "$timing_events"
+
+          # Run each module's tests from its own directory so Go uses that module's go.mod and go.sum.
+          # Per-module JSON and timing events are concatenated into the files later steps read;
+          # each module gets its own JUnit file. The modules are read from fd 3 so the tests can't
+          # consume the list from stdin.
+          failed_modules=()
+          while IFS=$'\t' read -r -u 3 dir packages; do
+            if [ "$dir" = "." ]; then slug=root; else slug="${dir//\//-}"; fi
+            goprivate="${GOPRIVATE:-}"
+            # tools/pipeline depends on a private module on every branch. Its modules come from the
+            # shared cache; this keeps Go from asking public proxies about private paths on a miss.
+            if [ "$dir" = "tools/pipeline" ]; then goprivate='github.com/hashicorp/*'; fi
+
+            # Load the packages and their test dependencies before testing them. -mod=mod lets Go
+            # record requirements a stale go.mod or go.sum is missing, so drift doesn't block the
+            # tests; the tidy check in ci.yml is what enforces tidy modules. A module that still can't
+            # load makes gotestsum report "0 tests, 1 error" without saying why, so we surface Go's
+            # error as an annotation and skip the module's tests.
+            # shellcheck disable=SC2086 # can't quote packages
+            if ! load_err=$(cd "$dir" && GOARCH=${{ inputs.go-arch }} GOPRIVATE="$goprivate" \
+                go list -mod=mod -deps -test -tags "${{ inputs.go-tags }}" $packages 2>&1 >/dev/null); then
+              echo "::error title=Go module '${dir}' failed to load::${load_err//$'\n'/%0A}"
+              failed_modules+=("${dir} (failed to load packages; see the annotation)")
+              git checkout -- "${dir}/go.mod" "${dir}/go.sum"
+              continue
+            fi
+            if ! git diff --quiet -- "${dir}/go.mod" "${dir}/go.sum"; then
+              echo "::warning title=Go module '${dir}' isn't tidy::Its go.mod or go.sum is missing requirements. Running its tests with the updated files; run \`make go-mod-tidy\` and commit the changes."
+              git --no-pager diff -- "${dir}/go.mod" "${dir}/go.sum"
+            fi
+
+            module_json=$(mktemp)
+            module_timing=$(mktemp)
+            # shellcheck disable=SC2086 # can't quote RERUN_FAILS, package_parallelism, extra-flags
+            if ! (
+              cd "$dir"
+              GOARCH=${{ inputs.go-arch }} GOPRIVATE="$goprivate" \
+                gotestsum --format=short-verbose \
+                  --junitfile "${junit_base%.xml}-${slug}.xml" \
+                  --jsonfile "$module_json" \
+                  --jsonfile-timing-events "$module_timing" \
+                  $RERUN_FAILS \
+                  --packages "$packages" \
+                  -- \
+                  $package_parallelism \
+                  -mod=mod \
+                  -tags "${{ inputs.go-tags }}" \
+                  -timeout=${{ inputs.go-test-timeout }} \
+                  -parallel="$test_parallelism" \
+                  ${{ inputs.extra-flags }}
+            ); then
+              echo "::error title=Go module '${dir}' tests failed::gotestsum exited non-zero for module '${dir}'"
+              failed_modules+=("${dir} (tests failed)")
+            fi
+            cat "$module_json" >> "$jsonfile"
+            cat "$module_timing" >> "$timing_events"
+            rm -f "$module_json" "$module_timing"
+            # Undo -mod=mod's edits so later steps, like the Go module cache save, see the committed files.
+            git checkout -- "${dir}/go.mod" "${dir}/go.sum"
+          done 3< <(jq -r '.[] | [.dir, (.packages | join(" "))] | @tsv' <<< "$MODULES")
+
+          if [ "${#failed_modules[@]}" -gt 0 ]; then
+            {
+              echo "### Failed Go modules (${{ inputs.name }}, ${{ matrix.id }})"
+              printf -- '- %s\n' "${failed_modules[@]}"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - if: github.repository == 'hashicorp/vault-enterprise' && (success() || failure())
+        name: Upload test results to Instana
+        continue-on-error: true
+        run: |
+          # Upload test results to Instana as spans for granular visibility
+          if [ -n "${INSTANA_AGENT_KEY}" ]; then
+            chmod +x scripts/upload-test-results-to-instana.sh
+            scripts/upload-test-results-to-instana.sh \
+              '${{ steps.metadata.outputs.gotestsum-jsonfile }}' \
+              '${{ inputs.name }}' \
+              '${{ matrix.id }}'
+          else
+            echo "INSTANA_AGENT_KEY not set, skipping Instana upload"
+          fi
       - if: (github.repository == 'hashicorp/vault' || github.repository == 'hashicorp/vault-enterprise') && (success() || failure())
         name: Prepare datadog-ci
         continue-on-error: true
@@ -494,11 +607,19 @@ jobs:
         continue-on-error: true
         env:
           DD_ENV: ci
+          DD_TAGS: "workflow:${{ github.workflow }},job:test-go,matrix_id:${{ matrix.id }},config:${{ inputs.name }}"
         run: |
-          if [[ ${{ github.repository }} == 'hashicorp/vault' ]]; then
+          if [[ ${{ github.repository }} == 'hashicorp/vault' || ${{ github.repository }} == 'hashicorp/vault-enterprise' ]]; then
             export DATADOG_API_KEY=${{ secrets.DATADOG_API_KEY }}
           fi
-          datadog-ci junit upload --service "$GITHUB_REPOSITORY" '${{ steps.metadata.outputs.gotestsum-junitfile }}'
+          junit_base='${{ steps.metadata.outputs.gotestsum-junitfile }}'
+          shopt -s nullglob
+          junit_files=("${junit_base%.xml}"-*.xml)
+          if [ "${#junit_files[@]}" -eq 0 ]; then
+            echo "no JUnit files to upload"
+            exit 0
+          fi
+          datadog-ci junit upload --service "$GITHUB_REPOSITORY" "${junit_files[@]}"
       - if: success() || failure()
         name: Archive test logs
         id: archive-test-logs
@@ -508,14 +629,14 @@ jobs:
           tar -cvf '${{ steps.metadata.outputs.go-test-log-archive-name }}' -C "${{ steps.metadata.outputs.go-test-log-dir }}" .
       - if: success() || failure()
         name: Upload test logs archives
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.metadata.outputs.go-test-log-archive-name }}
           path: ${{ steps.metadata.outputs.go-test-log-archive-name }}
           retention-days: 7
       - if: success() || failure()
         name: Upload test results
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.metadata.outputs.go-test-results-upload-key }}
           path: |
@@ -553,7 +674,7 @@ jobs:
           echo "data-race-result=${result}" | tee -a "$GITHUB_OUTPUT"
       - if: (success() || failure()) && steps.data-race-check.outputs.data-race-result == 'failure'
         name: Upload data race detector failure log
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.metadata.outputs.data-race-log-upload-key }}
           path: ${{ steps.metadata.outputs.go-test-dir }}/${{ steps.metadata.outputs.data-race-log-file }}
@@ -565,7 +686,7 @@ jobs:
       # so we have to fetch it from the API
       - if: success() || failure()
         name: Fetch job logs URL
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         continue-on-error: true
         with:
           retries: 3
@@ -599,15 +720,17 @@ jobs:
               const jobData = result.data.jobs.filter(
                 (job) => job.name.startsWith(prefixToSearchFor)
               );
+              if (jobData.length === 0) {
+                console.log("Warning: no job found matching prefix: " + prefixToSearchFor);
+                return;
+              }
               const url = jobData[0].html_url;
               const envVarName = "GH_JOB_URL";
               const envVar = envVarName + "=" + url;
               const envFile = process.env.GITHUB_ENV;
 
-              fs.appendFile(envFile, envVar, (err) => {
-                if (err) throw err;
-                console.log("Successfully set " + envVarName + " to: " + url);
-              });
+              await fs.promises.appendFile(envFile, envVar);
+              console.log("Successfully set " + envVarName + " to: " + url);
             } catch (error) {
               console.log("Error: " + error);
               return
@@ -620,18 +743,40 @@ jobs:
           # Then, it formats the results into rows of a Markdown table.k
           # An example row will resemble this:
           # | github.com/hashicorp/vault/package | TestName | fips | 0 | 2 | [view results](github.com/link-to-logs) |
-          jq -r -n 'inputs
+          # Group all pass/fail events by Package+Test, take the last verdict for each.
+          # This filters out tests that failed on the first attempt but passed on rerun
+          # (--rerun-fails), so only genuinely failing tests appear in the summary.
+          jq -r -n '[inputs]
+          | group_by(.Package + (.Test // ""))
+          | .[]
+          | last(.[] | select(.Action == "pass" or .Action == "fail"))
           | select(.Action == "fail")
           | "| ${{inputs.name}} | \(.Package) | \(.Test // "-") | \(.Elapsed) | ${{ matrix.id }} | [view test results :scroll:](${{ env.GH_JOB_URL }}) |"' \
           '${{ steps.metadata.outputs.gotestsum-timing-events }}' \
           >> '${{ steps.metadata.outputs.failure-summary-file-name }}'
       - if: success() || failure()
         name: Upload failure summary
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.metadata.outputs.failure-summary-file-name }}
           path: ${{ steps.metadata.outputs.failure-summary-file-name }}
-
+      - if: inputs.name == 'standard' && contains(inputs.go-tags, 'enterprise')
+        name: Compile tests without enterprise tag to make sure they're backportable
+        env:
+          MODULES: ${{ toJSON(fromJSON(needs.test-matrix.outputs.matrix)[matrix.id].modules) }}
+        run: |
+          set -euo pipefail
+          # -mod=mod keeps go.mod or go.sum drift from failing this step; ci.yml's tidy check enforces it.
+          while IFS=$'\t' read -r -u 3 dir packages; do
+            # shellcheck disable=SC2086 # can't quote packages
+            test_dirs=$(cd "$dir" && GOWORK=off go list -mod=mod -e -json -tags testonly $packages |
+              jq -r 'select(.TestGoFiles|length>0) | .Dir')
+            if [ -n "$test_dirs" ]; then
+              # shellcheck disable=SC2086 # can't quote test_dirs
+              (cd "$dir" && GOWORK=off go test -mod=mod -o /dev/null -c $test_dirs)
+            fi
+            git checkout -- "${dir}/go.mod" "${dir}/go.sum"
+          done 3< <(jq -r '(. // [])[] | [.dir, (.packages | join(" "))] | @tsv' <<< "$MODULES")
 
   status:
     # Perform final data aggregation and determine overall status
@@ -640,6 +785,12 @@ jobs:
       - test-matrix
       - test-go
     runs-on: ${{ fromJSON(inputs.runs-on-small) }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      issues: read
+      pull-requests: write
     outputs:
       data-race-output: ${{ steps.status.outputs.data-race-output }}
       data-race-result: ${{ steps.status.outputs.data-race-result }}
@@ -686,7 +837,7 @@ jobs:
           } | tee -a "$GITHUB_OUTPUT"
       # Aggregate, prune, and cache our timing data
       - if: ${{ ! cancelled() && needs.test-go.result == 'success' && inputs.test-timing-cache-save }}
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ needs.test-matrix.outputs.go-test-dir }}
           key: ${{ inputs.test-timing-cache-key }}-${{ github.run_number }}

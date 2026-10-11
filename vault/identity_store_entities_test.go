@@ -16,7 +16,7 @@ import (
 	"github.com/hashicorp/go-uuid"
 	credGithub "github.com/hashicorp/vault/builtin/credential/github"
 	"github.com/hashicorp/vault/helper/identity"
-	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/internalshared/namespace"
 	"github.com/hashicorp/vault/sdk/helper/strutil"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/stretchr/testify/require"
@@ -274,6 +274,249 @@ func TestIdentityStore_EntityByName(t *testing.T) {
 	sort.Strings(actual)
 	if !reflect.DeepEqual(expected, actual) {
 		t.Fatalf("bad: entity list response; expected: %#v\nactual: %#v", expected, actual)
+	}
+}
+
+// TestIdentityStore_EntityByName_DoesNotAllowIDRetarget verifies that updates
+// to entity/name paths cannot retarget a different entity via body id.
+func TestIdentityStore_EntityByName_DoesNotAllowIDRetarget(t *testing.T) {
+	ctx := namespace.RootContext(nil)
+	is, _, _ := testIdentityStoreWithGithubAuth(ctx, t)
+
+	resp, err := is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity",
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"name": "attacker",
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	attackerID := resp.Data["id"].(string)
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity",
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"name": "victim",
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity/name/test-dummy",
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"id":       attackerID,
+			"policies": []string{"hacked-policy"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	if resp == nil || !resp.IsError() {
+		t.Fatalf("expected error response, got: %#v", resp)
+	}
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity/id/" + attackerID,
+		Operation: logical.ReadOperation,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	if resp == nil {
+		t.Fatalf("expected attacker entity response")
+	}
+	if resp.Data["name"].(string) != "attacker" {
+		t.Fatalf("unexpected attacker name after blocked update: %#v", resp.Data["name"])
+	}
+	if strutil.StrListContains(resp.Data["policies"].([]string), "hacked-policy") {
+		t.Fatalf("attacker policies unexpectedly include hacked-policy: %#v", resp.Data["policies"])
+	}
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity/name/test-dummy",
+		Operation: logical.ReadOperation,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	if resp != nil {
+		t.Fatalf("expected no entity to be created at blocked name path")
+	}
+}
+
+// TestIdentityStore_EntityByID_IgnoresExternalID verifies that entity/id writes
+// ignore external_id rather than using it to select or modify an entity.
+func TestIdentityStore_EntityByID_IgnoresExternalID(t *testing.T) {
+	ctx := namespace.RootContext(nil)
+	is, _, _ := testIdentityStoreWithGithubAuth(ctx, t)
+
+	resp, err := is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity",
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"name": "attacker-id-path",
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	attackerID := resp.Data["id"].(string)
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity",
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"name":        "victim-id-path",
+			"external_id": "victim-id-path-external-id",
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	victimID := resp.Data["id"].(string)
+	victim, err := is.MemDBEntityByID(victimID, false)
+	if err != nil {
+		t.Fatalf("failed to read victim entity: %v", err)
+	}
+	if victim.ExternalID != "" {
+		t.Fatalf("external_id was written to a generic entity: %q", victim.ExternalID)
+	}
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity/id/" + attackerID,
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"external_id": "victim-id-path-external-id",
+			"policies":    []string{"hacked-policy"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	if resp == nil || resp.IsError() {
+		t.Fatalf("expected successful response, got: %#v", resp)
+	}
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity/id/" + attackerID,
+		Operation: logical.ReadOperation,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	if resp == nil || !strutil.StrListContains(resp.Data["policies"].([]string), "hacked-policy") {
+		t.Fatalf("attacker entity was not updated: %#v", resp)
+	}
+	attacker, err := is.MemDBEntityByID(attackerID, false)
+	if err != nil {
+		t.Fatalf("failed to read attacker entity: %v", err)
+	}
+	if attacker.ExternalID != "" {
+		t.Fatalf("external_id was written during a generic update: %q", attacker.ExternalID)
+	}
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity/id/" + victimID,
+		Operation: logical.ReadOperation,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	if resp == nil {
+		t.Fatalf("expected victim entity response")
+	}
+	if strutil.StrListContains(resp.Data["policies"].([]string), "hacked-policy") {
+		t.Fatalf("victim policies unexpectedly include hacked-policy: %#v", resp.Data["policies"])
+	}
+}
+
+// TestIdentityStore_EntityByName_IgnoresExternalID verifies that entity/name
+// writes ignore external_id rather than using it to select or modify an entity.
+func TestIdentityStore_EntityByName_IgnoresExternalID(t *testing.T) {
+	ctx := namespace.RootContext(nil)
+	is, _, _ := testIdentityStoreWithGithubAuth(ctx, t)
+
+	resp, err := is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity",
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"name":        "attacker-ext",
+			"external_id": "attacker-external-id",
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	attackerID := resp.Data["id"].(string)
+	attacker, err := is.MemDBEntityByID(attackerID, false)
+	if err != nil {
+		t.Fatalf("failed to read attacker entity: %v", err)
+	}
+	if attacker.ExternalID != "" {
+		t.Fatalf("external_id was written to a generic entity: %q", attacker.ExternalID)
+	}
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity",
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"name": "victim-ext",
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity/name/test-dummy-ext",
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"external_id": "attacker-external-id",
+			"policies":    []string{"hacked-policy"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	if resp == nil || resp.IsError() {
+		t.Fatalf("expected successful response, got: %#v", resp)
+	}
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity/id/" + attackerID,
+		Operation: logical.ReadOperation,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	if resp == nil {
+		t.Fatalf("expected attacker entity response")
+	}
+	if resp.Data["name"].(string) != "attacker-ext" {
+		t.Fatalf("unexpected attacker name after blocked update: %#v", resp.Data["name"])
+	}
+	if strutil.StrListContains(resp.Data["policies"].([]string), "hacked-policy") {
+		t.Fatalf("attacker entity was unexpectedly updated: %#v", resp.Data["policies"])
+	}
+
+	resp, err = is.HandleRequest(ctx, &logical.Request{
+		Path:      "entity/name/test-dummy-ext",
+		Operation: logical.ReadOperation,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	if resp == nil {
+		t.Fatalf("expected entity to be created at name path")
+	}
+	if resp.Data["name"] != "test-dummy-ext" {
+		t.Fatalf("unexpected entity created at name path: %#v", resp.Data)
 	}
 }
 
@@ -602,47 +845,6 @@ func TestIdentityStore_ContextCancel(t *testing.T) {
 	}
 	if resp.Warnings == nil || len(resp.Warnings) == 0 {
 		t.Fatalf("expected warning for cancelled context. resp:%#v", resp)
-	}
-}
-
-func TestIdentityStore_ListEntities(t *testing.T) {
-	var err error
-	var resp *logical.Response
-
-	ctx := namespace.RootContext(nil)
-	is, _, _ := testIdentityStoreWithGithubAuth(ctx, t)
-
-	entityReq := &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "entity",
-	}
-
-	expected := []string{}
-	for i := 0; i < 10; i++ {
-		resp, err = is.HandleRequest(ctx, entityReq)
-		if err != nil || (resp != nil && resp.IsError()) {
-			t.Fatalf("err:%v resp:%#v", err, resp)
-		}
-		expected = append(expected, resp.Data["id"].(string))
-	}
-
-	listReq := &logical.Request{
-		Operation: logical.ListOperation,
-		Path:      "entity/id",
-	}
-
-	resp, err = is.HandleRequest(ctx, listReq)
-	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%v resp:%#v", err, resp)
-	}
-
-	actual := resp.Data["keys"].([]string)
-
-	// Sort the operands for DeepEqual to work
-	sort.Strings(actual)
-	sort.Strings(expected)
-	if !reflect.DeepEqual(expected, actual) {
-		t.Fatalf("bad: listed entity IDs; expected: %#v\n actual: %#v\n", expected, actual)
 	}
 }
 

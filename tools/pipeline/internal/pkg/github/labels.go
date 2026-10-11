@@ -1,10 +1,11 @@
-// Copyright IBM Corp. 2016, 2025
+// Copyright IBM Corp. 2016, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package github
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 
@@ -24,6 +25,41 @@ func filterNonBackportLabels(labels Labels, backportPrefix string) []string {
 	return labelsToAdd
 }
 
+// removeLabelFromIssue removes a given label from the issue or PR.
+// If the label is not present, the error is ignored.
+func removeLabelFromIssue(
+	ctx context.Context,
+	github *libgithub.Client,
+	owner string,
+	repo string,
+	number int,
+	label string,
+) error {
+	if label == "" {
+		return errors.New("no label was provided for removal")
+	}
+
+	ctx = slogctx.Append(
+		ctx,
+		slog.String("label", label),
+		slog.Int("issue-number", number),
+	)
+
+	slog.Default().DebugContext(ctx, "removing label from issue or pull request")
+	resp, err := github.Issues.RemoveLabelForIssue(ctx, owner, repo, number, label)
+	if err != nil {
+		// 404 means the label is not present — that's fine.
+		if resp != nil && resp.StatusCode == 404 {
+			slog.Default().DebugContext(ctx, "label not present on issue or pull request, skipping removal")
+			return nil
+		}
+		return err
+	}
+
+	slog.Default().DebugContext(ctx, "successfully removed label from issue or pull request")
+	return nil
+}
+
 // addLabelsToIssue adds the given labels to the issue or pull request
 func addLabelsToIssue(
 	ctx context.Context,
@@ -38,7 +74,8 @@ func addLabelsToIssue(
 		return nil
 	}
 
-	ctx = slogctx.Append(ctx,
+	ctx = slogctx.Append(
+		ctx,
 		slog.String("labels", strings.Join(labels, ", ")),
 		slog.Int("issue-number", number),
 	)

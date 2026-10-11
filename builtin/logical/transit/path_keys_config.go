@@ -65,6 +65,11 @@ the latest version of the key is allowed.`,
 being automatically rotated. A value of 0
 disables automatic rotation for the key.`,
 			},
+
+			"key_usages": {
+				Type:        framework.TypeStringSlice,
+				Description: `List of cryptographic operations the key facilitates, derived from the key type. Possible values are: aead-encryption, symmetric-encryption, asymmetric-encryption, digital-signature, message-authentication.`,
+			},
 		},
 
 		Callbacks: map[logical.Operation]framework.OperationFunc{
@@ -217,13 +222,13 @@ func (b *backend) pathKeysConfigWrite(ctx context.Context, req *logical.Request,
 			persistNeeded = true
 		}
 
-		if p.Type == keysutil.KeyType_MANAGED_KEY && autoRotatePeriod != 0 {
+		if p.KeyVersionType(p.LatestVersion) == keysutil.KeyType_MANAGED_KEY && autoRotatePeriod != 0 {
 			return logical.ErrorResponse("Auto rotation can not be set for managed keys"), nil
 		}
 	}
 
 	if !persistNeeded {
-		resp, err := b.formatKeyPolicy(p, nil)
+		resp, err := b.formatKeyPolicy(ctx, p, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -244,7 +249,7 @@ func (b *backend) pathKeysConfigWrite(ctx context.Context, req *logical.Request,
 		return nil, err
 	}
 
-	resp, err = b.formatKeyPolicy(p, nil)
+	resp, err = b.formatKeyPolicy(ctx, p, nil)
 	if err != nil {
 		return nil, err
 	}

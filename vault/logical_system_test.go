@@ -34,12 +34,12 @@ import (
 	"github.com/hashicorp/vault/helper/constants"
 	"github.com/hashicorp/vault/helper/experiments"
 	"github.com/hashicorp/vault/helper/identity"
-	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/helper/random"
 	"github.com/hashicorp/vault/helper/testhelpers/corehelpers"
 	"github.com/hashicorp/vault/helper/testhelpers/pluginhelpers"
 	"github.com/hashicorp/vault/helper/versions"
 	"github.com/hashicorp/vault/internalshared/configutil"
+	"github.com/hashicorp/vault/internalshared/namespace"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/compressutil"
 	"github.com/hashicorp/vault/sdk/helper/consts"
@@ -772,7 +772,7 @@ func TestSystemBackend_PathCapabilities(t *testing.T) {
 
 	core, b, rootToken := testCoreSystemBackend(t)
 
-	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy)
+	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy, WithDenySlashInTemplatedPaths(core.denySlashInTemplatedPolicyPaths))
 	err = core.policyStore.SetPolicy(namespace.RootContext(nil), policy)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -981,7 +981,7 @@ func testCapabilities(t *testing.T, endpoint string) {
 		t.Fatalf("bad: got\n%#v\nexpected\n%#v\n", actual, expected)
 	}
 
-	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy)
+	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy, WithDenySlashInTemplatedPaths(core.denySlashInTemplatedPolicyPaths))
 	err = core.policyStore.SetPolicy(namespace.RootContext(nil), policy)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -1037,7 +1037,7 @@ func TestSystemBackend_CapabilitiesAccessor_BC(t *testing.T) {
 		t.Fatalf("bad: got\n%#v\nexpected\n%#v\n", actual, expected)
 	}
 
-	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy)
+	policy, _ := ParseACLPolicy(namespace.RootNamespace, capabilitiesPolicy, WithDenySlashInTemplatedPaths(core.denySlashInTemplatedPolicyPaths))
 	err = core.policyStore.SetPolicy(namespace.RootContext(nil), policy)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -1430,6 +1430,70 @@ func TestSystemBackend_remount_trailingSpacesInToPath(t *testing.T) {
 	}
 	if resp.Data["error"] != `'to' path cannot contain trailing whitespace` {
 		t.Fatalf("bad: %v", resp)
+	}
+}
+
+// TestSystemBackend_remount_leadingSlashInPaths verifies that a leading '/' in
+// the 'from' or 'to' path is silently stripped and the remount succeeds. A
+// leading slash would otherwise cause the namespace lookup to fall back to root
+// (because the radix tree stores paths without a leading slash), placing the
+// mount in the wrong namespace.
+func TestSystemBackend_remount_leadingSlashInPaths(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		from string
+		to   string
+	}{
+		{
+			name: "leading slash in to path",
+			from: "secret",
+			to:   "/foo",
+		},
+		{
+			name: "leading slash in from path",
+			from: "/secret",
+			to:   "foo",
+		},
+		{
+			name: "leading slash in both paths",
+			from: "/secret",
+			to:   "/foo",
+		},
+		{
+			name: "multiple leading slashes",
+			from: "secret",
+			to:   "///foo",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			b := testSystemBackend(t)
+
+			req := logical.TestRequest(t, logical.UpdateOperation, "remount")
+			req.Data["from"] = tc.from
+			req.Data["to"] = tc.to
+			req.Data["config"] = structs.Map(MountConfig{})
+			resp, err := b.HandleRequest(namespace.RootContext(nil), req)
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+
+			corehelpers.RetryUntil(t, 5*time.Second, func() error {
+				statusReq := logical.TestRequest(t, logical.ReadOperation, fmt.Sprintf("remount/status/%s", resp.Data["migration_id"]))
+				statusResp, err := b.HandleRequest(namespace.RootContext(nil), statusReq)
+				if err != nil {
+					return fmt.Errorf("status request failed: %w", err)
+				}
+				migrationInfo := statusResp.Data["migration_info"].(*MountMigrationInfo)
+				if migrationInfo.MigrationStatus != MigrationStatusSuccess.String() {
+					return fmt.Errorf("expected migration status to be successful, got %q", migrationInfo.MigrationStatus)
+				}
+				return nil
+			})
+		})
 	}
 }
 
@@ -2744,8 +2808,6 @@ func TestSystemBackend_policyCRUD(t *testing.T) {
 	if resp != nil && (resp.IsError() || len(resp.Data) > 0) {
 		t.Fatalf("bad: %#v", resp)
 	}
-	// TODO (HCL_DUP_KEYS_DEPRECATION): remove this expectation once deprecation is done
-	require.NotContains(t, resp.Warnings, "policy contains duplicate attributes, which will no longer be supported in a future version")
 
 	// validate the response structure for policy named Update
 	schema.ValidateResponse(
@@ -2853,34 +2915,18 @@ func TestSystemBackend_policyCRUD(t *testing.T) {
 }
 
 // TestSystemBackend_writeHCLDuplicateAttributes checks that trying to create a policy with duplicate HCL attributes
-// results in a warning being returned by the API
+// results in an error being returned by the API
 func TestSystemBackend_writeHCLDuplicateAttributes(t *testing.T) {
 	// policy with duplicate attribute
 	rules := `path "foo/" { policy = "read" policy = "read" }`
 	req := logical.TestRequest(t, logical.UpdateOperation, "policy/foo")
 	req.Data["policy"] = rules
 
-	t.Run("fails with env unset", func(t *testing.T) {
-		b := testSystemBackend(t)
-		resp, err := b.HandleRequest(namespace.RootContext(nil), req)
-		require.Error(t, err)
-		require.Error(t, resp.Error())
-		require.EqualError(t, resp.Error(), "failed to parse policy: The argument \"policy\" at 1:31 was already set. Each argument can only be defined once")
-	})
-
-	// TODO (HCL_DUP_KEYS_DEPRECATION): leave only test above once deprecation is done
-	t.Run("warning with env set", func(t *testing.T) {
-		t.Setenv(random.AllowHclDuplicatesEnvVar, "true")
-		b := testSystemBackend(t)
-		resp, err := b.HandleRequest(namespace.RootContext(nil), req)
-		if err != nil {
-			t.Fatalf("err: %v %#v", err, resp)
-		}
-		if resp != nil && (resp.IsError() || len(resp.Data) > 0) {
-			t.Fatalf("bad: %#v", resp)
-		}
-		require.Contains(t, resp.Warnings, "policy contains duplicate attributes, which will no longer be supported in a future version")
-	})
+	b := testSystemBackend(t)
+	resp, err := b.HandleRequest(namespace.RootContext(nil), req)
+	require.Error(t, err)
+	require.Error(t, resp.Error())
+	require.EqualError(t, resp.Error(), "failed to parse policy: The argument \"policy\" at 1:31 was already set. Each argument can only be defined once")
 }
 
 func TestSystemBackend_enableAudit(t *testing.T) {
@@ -4828,7 +4874,7 @@ path "sys/*" {
   capabilities = ["update"]
 }`
 
-	pol, err := ParseACLPolicy(namespace.RootNamespace, rules)
+	pol, err := ParseACLPolicy(namespace.RootNamespace, rules, WithDenySlashInTemplatedPaths(core.denySlashInTemplatedPolicyPaths))
 	require.NoError(t, err)
 	require.NoError(t, core.policyStore.SetPolicy(ctx, pol))
 
@@ -6003,7 +6049,7 @@ func WalkLogicalStorage(ctx context.Context, store logical.Storage, walker walkF
 				if subkey == "" {
 					continue
 				}
-				subkey = fmt.Sprintf("%s%s", key, subkey)
+				subkey = key + subkey
 				keys = append(keys, subkey)
 			}
 		}
@@ -7047,7 +7093,7 @@ func TestGetSealBackendStatus(t *testing.T) {
 			testAccess, wrappers := seal.NewTestSeal(&tt.sealOpts)
 
 			c := TestCoreWithSeal(t, NewAutoSeal(testAccess), false)
-			_, keys, _ := TestCoreInitClusterWrapperSetup(t, c, nil)
+			_, keys, _ := TestCoreInitClusterWrapperSetup(t, c)
 			for _, key := range keys {
 				_, err := TestCoreUnseal(c, key)
 				require.NoError(t, err)
@@ -7114,7 +7160,7 @@ func TestGetSealBackendStatus(t *testing.T) {
 	shamirSeal := NewDefaultSeal(a)
 
 	c := TestCoreWithSeal(t, shamirSeal, false)
-	keys, _, _ := TestCoreInitClusterWrapperSetup(t, c, nil)
+	keys, _, _ := TestCoreInitClusterWrapperSetup(t, c)
 	for _, key := range keys {
 		_, err := TestCoreUnseal(c, key)
 		require.NoError(t, err)
@@ -7467,7 +7513,6 @@ func TestWellKnownSysApi(t *testing.T) {
 
 	require.Contains(t, resp.Data["keys"], "mylabel1")
 	require.Contains(t, resp.Data["keys"], "mylabel2")
-	require.Len(t, resp.Data["keys"], 2)
 
 	keyInfo := resp.Data["key_info"].(map[string]interface{})
 	keyInfoLabel1 := keyInfo["mylabel1"].(map[string]interface{})

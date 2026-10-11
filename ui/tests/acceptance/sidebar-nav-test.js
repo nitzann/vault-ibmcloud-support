@@ -5,13 +5,18 @@
 
 import { module, test } from 'qunit';
 import { setupApplicationTest } from 'ember-qunit';
-import { click, currentURL } from '@ember/test-helpers';
+import { click, currentURL, visit } from '@ember/test-helpers';
 import { setupMirage } from 'ember-cli-mirage/test-support';
 import { login } from 'vault/tests/helpers/auth/auth-helpers';
 import modifyPassthroughResponse from 'vault/mirage/helpers/modify-passthrough-response';
 import { setRunOptions } from 'ember-a11y-testing/test-support';
 import { GENERAL } from 'vault/tests/helpers/general-selectors';
 import { WIZARD_ID_MAP } from 'vault/utils/constants/wizard';
+
+const SELECTORS = {
+  sidebarToggle: '.hds-app-side-nav__toggle-button',
+  sidebarMinimizedClass: 'hds-app-side-nav--is-minimized',
+};
 
 const link = (label) => `[data-test-sidebar-nav-link="${label}"]`;
 const panel = (label) => `[data-test-sidebar-nav-panel="${label}"]`;
@@ -35,6 +40,7 @@ module('Acceptance | sidebar navigation', function (hooks) {
     await login();
     // dismiss wizard
     this.owner.lookup('service:wizard').dismiss(WIZARD_ID_MAP.authMethods);
+    this.version = this.owner.lookup('service:version');
   });
 
   test('it should navigate back to the dashboard when logo is clicked in app header', async function (assert) {
@@ -93,6 +99,34 @@ module('Acceptance | sidebar navigation', function (hooks) {
     }
   });
 
+  test('ACL policies nav link stays active when viewing or editing an individual ACL policy', async function (assert) {
+    // Visiting the policy show/edit route (vault.cluster.policy) should keep the
+    // "ACL policies" nav link active. Without current-when including vault.cluster.policy,
+    // the link would go inactive as soon as the user navigated away from the list.
+    await visit('/vault/policy/acl/default');
+    assert.strictEqual(currentURL(), '/vault/policy/acl/default', 'on ACL policy show page');
+    assert
+      .dom(link('ACL policies'))
+      .hasClass('active', 'ACL policies nav link is active on policy show page');
+  });
+
+  test('ACL policies nav link stays active when editing an individual ACL policy', async function (assert) {
+    await visit('/vault/policy/acl/default/edit');
+    assert.strictEqual(currentURL(), '/vault/policy/acl/default/edit', 'on ACL policy edit page');
+    assert
+      .dom(link('ACL policies'))
+      .hasClass('active', 'ACL policies nav link is active on policy edit page');
+  });
+
+  test('ACL policies nav link is not active on unrelated access routes', async function (assert) {
+    // Ensures the nav link does not stay falsely active when the user navigates
+    // to a different section of the Access panel.
+    await visit('/vault/access/identity/groups');
+    assert
+      .dom(link('ACL policies'))
+      .doesNotHaveClass('active', 'ACL policies nav link is not active on Groups page');
+  });
+
   test('it should link to correct routes at the tools level', async function (assert) {
     assert.expect(7);
 
@@ -134,8 +168,47 @@ module('Acceptance | sidebar navigation', function (hooks) {
     await click('[data-test-auth-enable]');
     assert.dom('[data-test-sidebar-nav-panel="Access control"]').exists('Access nav panel renders');
     await click(link('Authentication methods'));
-    await click(GENERAL.linkedBlock('token'));
+    await click(GENERAL.linkTo('token/'));
     await click('[data-test-configure-link]');
     assert.dom('[data-test-sidebar-nav-panel="Access control"]').exists('Access nav panel renders');
+  });
+
+  test('it should render the sidebar nav toggle button', async function (assert) {
+    assert.dom(SELECTORS.sidebarToggle).exists('Sidebar nav toggle button renders');
+  });
+
+  test('opening namespace picker does not change sidebar collapsed state', async function (assert) {
+    assert.expect(3);
+    this.version.features = ['Namespaces'];
+
+    await click(SELECTORS.sidebarToggle);
+    assert.dom('[data-test-sidebar]').hasClass(SELECTORS.sidebarMinimizedClass, 'sidebar is collapsed');
+
+    await click('[data-test-button="namespace-picker"]');
+    assert
+      .dom('[data-test-sidebar]')
+      .hasClass(SELECTORS.sidebarMinimizedClass, 'sidebar remains collapsed after opening namespace picker');
+    assert
+      .dom('[data-test-sidebar]')
+      .hasClass(SELECTORS.sidebarMinimizedClass, 'sidebar remains minimized after closing namespace picker');
+  });
+
+  test('collapsed sidebar does not overlap web repl when console is open', async function (assert) {
+    assert.expect(3);
+
+    await click(SELECTORS.sidebarToggle);
+    assert.dom('[data-test-sidebar]').hasClass(SELECTORS.sidebarMinimizedClass, 'sidebar is collapsed');
+
+    await click('[data-test-console-toggle]');
+    assert.dom('[data-test-console-panel]').hasClass('panel-open', 'console panel is open');
+
+    const consolePanel = document.querySelector('.console-ui-panel');
+    const sidebar = document.querySelector('[data-test-sidebar]');
+    const consolePanelZIndex = parseInt(getComputedStyle(consolePanel).zIndex, 10);
+    const sidebarZIndex = parseInt(getComputedStyle(sidebar).zIndex, 10) || 0;
+    assert.true(
+      consolePanelZIndex > sidebarZIndex,
+      `console panel z-index (${consolePanelZIndex}) is higher than sidebar z-index (${sidebarZIndex})`
+    );
   });
 });

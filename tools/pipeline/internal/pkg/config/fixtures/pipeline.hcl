@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2016, 2025
+// Copyright IBM Corp. 2016, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 changed_files {
@@ -118,6 +118,9 @@ changed_files {
         joinpath("scripts", "testing"),
         joinpath("specs"),
         joinpath(".release", "ibm-pao"),
+        // Internal developer tooling that must not sync to CE
+        ".agents",
+        joinpath("ui", ".agents"),
       ]
     }
 

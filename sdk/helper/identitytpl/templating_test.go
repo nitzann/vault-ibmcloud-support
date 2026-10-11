@@ -38,6 +38,7 @@ func TestPopulate_Basic(t *testing.T) {
 		groupMetadata       map[string]string
 		groupMemberships    []string
 		now                 time.Time
+		denySlash           bool
 	}{
 		// time.* tests. Keep tests with time.Now() at the front to avoid false
 		// positives due to the second changing during the test
@@ -70,6 +71,12 @@ func TestPopulate_Basic(t *testing.T) {
 			err:   errors.New("missing time operand"),
 		},
 
+		{
+			name:  "invalid_mode",
+			mode:  -1,
+			input: "path foobar {",
+			err:   errors.New("unknown mode -1"),
+		},
 		{
 			name:   "no_templating",
 			input:  "path foobar {",
@@ -510,6 +517,26 @@ path"secret/metadata/{{identity.entity.metadata.team}}/*" {
 			metadata:   map[string]string{"team": "admin"},
 			err:        ErrTemplatedWildcard,
 		},
+		{
+			name: "path_separator_denied",
+			input: `path "secret/metadata/{{identity.entity.metadata.team}}/*" {
+    capabilities = ["read", "list"]
+}`,
+			metadata:  map[string]string{"team": "admin/team2"},
+			denySlash: true,
+			err:       ErrTemplatedSlash,
+		},
+		{
+			name: "path_separator_allowed",
+			input: `path "secret/metadata/{{identity.entity.metadata.team}}/*" {
+    capabilities = ["read", "list"]
+}`,
+			metadata:  map[string]string{"team": "admin/team2"},
+			denySlash: false,
+			output: `path "secret/metadata/admin/team2/*" {
+    capabilities = ["read", "list"]
+}`,
+		},
 	}
 
 	for _, test := range tests {
@@ -553,13 +580,14 @@ path"secret/metadata/{{identity.entity.metadata.team}}/*" {
 			}
 
 			subst, out, err := PopulateString(PopulateStringInput{
-				Mode:              test.mode,
-				ValidityCheckOnly: test.validityCheckOnly,
-				String:            test.input,
-				Entity:            entity,
-				Groups:            groups,
-				NamespaceID:       "root",
-				Now:               test.now,
+				Mode:                      test.mode,
+				ValidityCheckOnly:         test.validityCheckOnly,
+				String:                    test.input,
+				Entity:                    entity,
+				Groups:                    groups,
+				NamespaceID:               "root",
+				Now:                       test.now,
+				DenySlashInTemplatedPaths: test.denySlash,
 			})
 			if err != nil {
 				if test.err == nil {

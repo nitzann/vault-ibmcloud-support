@@ -8,11 +8,11 @@
   <div class="has-top-margin-s has-bottom-margin-s">
     <Hds::Button
       @text="Create ACL policy"
-      @route="vault.cluster.policies.create"
-      @model="acl"
+      @route="vault.cluster.policies.acl.create"
       @icon="arrow-right"
       @iconPosition="trailing"
       @color="secondary"
+      {{on "click" (fn this.trackQuickActionCta "Create ACL policy")}}
       class="has-bottom-margin-m"
     />
     <Hds::Button
@@ -21,6 +21,7 @@
       @icon="arrow-right"
       @iconPosition="trailing"
       @color="secondary"
+      {{on "click" (fn this.trackQuickActionCta "Secrets sync")}}
       class="has-bottom-margin-m"
     />
     <Hds::Button
@@ -29,6 +30,7 @@
       @icon="arrow-right"
       @iconPosition="trailing"
       @color="secondary"
+      {{on "click" (fn this.trackQuickActionCta "API explorer")}}
       class="has-bottom-margin-m"
     />
     <Hds::Button
@@ -37,6 +39,7 @@
       @icon="arrow-right"
       @iconPosition="trailing"
       @color="secondary"
+      {{on "click" (fn this.trackQuickActionCta "Set up MFA")}}
       class="has-bottom-margin-m"
     />
     <Hds::Button
@@ -45,6 +48,7 @@
       @icon="arrow-right"
       @iconPosition="trailing"
       @color="secondary"
+      {{on "click" (fn this.trackQuickActionCta "Usage metrics")}}
       class="has-bottom-margin-m"
     />
   </div>
@@ -90,7 +94,8 @@
             <p class="has-left-margin-xs" data-test-loading>Loading options...</p>
           {{else if this.searchSelectParams.isKV}}
             {{! use special input to allow searching for KVv2 secrets inside a directory }}
-            <KvSuggestionInput
+            <SuggestionInput
+              @type="kv"
               @label="Secret Path"
               @value={{this.paramValue}}
               @mountPath={{this.selectedEngine.id}}

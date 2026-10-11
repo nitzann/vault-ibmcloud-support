@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/go-test/deep"
-	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/internalshared/namespace"
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
@@ -481,6 +481,24 @@ path "/" {
 	}
 
 	if !strings.Contains(err.Error(), `path "/": invalid capability "banana"`) {
+		t.Errorf("bad error: %s", err)
+	}
+}
+
+// TestPolicy_ParseDuplicateAttributes ensures that parsing a policy with
+// duplicate HCL attributes always fails.
+func TestPolicy_ParseDuplicateAttributes(t *testing.T) {
+	_, err := ParseACLPolicy(namespace.RootNamespace, strings.TrimSpace(`
+path "secret" {
+	capabilities = ["read"]
+	capabilities = ["update"]
+}
+`))
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+
+	if !strings.Contains(err.Error(), "Each argument can only be defined once") {
 		t.Errorf("bad error: %s", err)
 	}
 }

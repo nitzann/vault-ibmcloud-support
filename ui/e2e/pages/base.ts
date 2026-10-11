@@ -28,12 +28,16 @@ export class BasePage {
 
   async disableEngine(path: string) {
     await this.page.goto('secrets-engines');
+    // Narrow the list first so the engine is on page 1 no matter how many engines are mounted.
+    await this.page.getByPlaceholder('Search by path').fill(path);
     await this.page
-      .getByRole('row', { name: `Type of backend ${path}` })
-      .getByLabel('supported secrets engine menu')
+      .getByRole('row')
+      .filter({ has: this.page.getByRole('gridcell', { name: `${path}/`, exact: true }) })
+      .getByRole('button', { name: 'Options' })
       .click();
-    await this.page.getByRole('button', { name: 'Delete' }).click();
-    await this.page.getByRole('button', { name: 'Confirm' }).click();
+    await this.page.getByRole('button', { name: 'Delete engine path' }).click();
+    await this.page.getByRole('textbox', { name: 'Confirm deletion   Type "' }).fill('delete-engine');
+    await this.page.getByRole('button', { name: 'Delete engine' }).click();
   }
 
   /**
@@ -58,7 +62,12 @@ export class BasePage {
 
     // Click "Enable new engine"
     await this.page.getByRole('link', { name: 'Enable new engine' }).click();
-    await this.page.getByRole('heading', { name: findEngineDisplayName(engineType) }).click();
+    await this.page
+      .locator('label')
+      .filter({ hasText: findEngineDisplayName(engineType) })
+      .getByLabel('- enabled engine type')
+      .click();
+    await this.page.getByRole('button', { name: 'Next' }).click();
 
     if (options?.external) {
       // Prerequisite: mock plugin catalog endpoint in the test so the External plugin option is available.

@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/armon/go-metrics"
-	"github.com/hashicorp/vault/helper/metricsutil"
-	"github.com/hashicorp/vault/helper/namespace"
+	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/hashicorp/vault/helper/pluginconsts"
+	"github.com/hashicorp/vault/internalshared/metricsutil"
+	"github.com/hashicorp/vault/internalshared/namespace"
 	"github.com/hashicorp/vault/limits"
 	"github.com/hashicorp/vault/physical/raft"
 	"github.com/hashicorp/vault/sdk/helper/consts"
@@ -466,7 +466,7 @@ func (c *Core) findOfficialKvMounts(ctx context.Context, includeLocal, includeRe
 				continue
 			}
 
-			if !(isOfficialOrBuiltin(runner)) {
+			if !isOfficialOrBuiltin(runner) {
 				continue
 			}
 
@@ -856,8 +856,10 @@ type RoleCounts struct {
 	GCPImpersonatedAccounts    int `json:"gcp_impersonated_accounts"`
 	LDAPDynamicRoles           int `json:"ldap_dynamic_roles"`
 	LDAPStaticRoles            int `json:"ldap_static_roles"`
+	LDAPLibrarySets            int `json:"ldap_library_sets"`
 	OpenLDAPDynamicRoles       int `json:"openldap_dynamic_roles"`
 	OpenLDAPStaticRoles        int `json:"openldap_static_roles"`
+	OpenLDAPLibrarySets        int `json:"openldap_library_sets"`
 	AlicloudDynamicRoles       int `json:"alicloud_dynamic_roles"`
 	RabbitMQDynamicRoles       int `json:"rabbitmq_dynamic_roles"`
 	ConsulDynamicRoles         int `json:"consul_dynamic_roles"`
@@ -866,17 +868,36 @@ type RoleCounts struct {
 	MongoDBAtlasDynamicRoles   int `json:"mongodb_atlas_dynamic_roles"`
 	TerraformCloudDynamicRoles int `json:"terraformcloud_dynamic_roles"`
 	OSLocalAccountRoles        int `json:"os_local_account_static_roles"`
+	TransformRoles             int `json:"transform_roles"`
+	SSHOTPRoles                int `json:"ssh_otp_roles"`
+	SSHCARoles                 int `json:"ssh_ca_roles"`
+	SpiffeRoles                int `json:"spiffe_roles"`
 }
 
 type ManagedKeyCounts struct {
-	TotpKeys int `json:"totp_keys"`
-	KmseKeys int `json:"kmse_keys"`
+	TotpKeys    int `json:"totp_keys"`
+	KmseKeys    int `json:"kmse_keys"`
+	TransitKeys int `json:"transit_keys"`
+}
+
+// SecretEngineResourceCounts holds counts of secret engine resources for product
+// usage telemetry. "Resource" is a catch-all for countable items that aren't keys
+// or roles (tracked by ManagedKeyCounts and RoleCounts), e.g. Transform
+// transformations/templates/alphabets/stores and KMIP scopes/scope roles/CAs.
+type SecretEngineResourceCounts struct {
+	TransformTransformations int `json:"transform_transformations"`
+	TransformTemplates       int `json:"transform_templates"`
+	TransformAlphabets       int `json:"transform_alphabets"`
+	TransformStores          int `json:"transform_stores"`
+	KmipScopes               int `json:"kmip_scopes"`
+	KmipScopeRoles           int `json:"kmip_scope_roles"`
+	KmipCas                  int `json:"kmip_cas"`
 }
 
 // GetRoleCountsForCluster returns the total role counts across all mounts for a primary or secondary cluster
 // For use in tests only
 func (c *Core) GetRoleCountsForCluster() *RoleCounts {
-	m, err := c.CountMetricsFromMounts(false)
+	m, err := c.CountMetricsSecretMounts(false, false)
 	if err != nil {
 		return nil
 	}
@@ -884,6 +905,31 @@ func (c *Core) GetRoleCountsForCluster() *RoleCounts {
 		return combineRoleCounts(m.LocalRoleCounts, m.ReplicatedRoleCounts)
 	}
 	return m.LocalRoleCounts
+}
+
+// GetManagedKeyCountsForCluster returns the total managed key counts across all mounts
+func (c *Core) GetManagedKeyCountsForCluster() *ManagedKeyCounts {
+	m, err := c.CountMetricsSecretMounts(false, false)
+	if err != nil {
+		return nil
+	}
+	if c.isPrimary() {
+		return combineManagedKeyCounts(m.LocalManagedKeys, m.ReplicatedManagedKeys)
+	}
+	return m.LocalManagedKeys
+}
+
+// GetSecretEngineResourceCountsForCluster returns the total secret engine resource counts across all mounts for a primary or secondary cluster.
+// On performance secondaries, only local mounts are counted.
+func (c *Core) GetSecretEngineResourceCountsForCluster() *SecretEngineResourceCounts {
+	m, err := c.CountMetricsSecretMounts(false, false)
+	if err != nil {
+		return nil
+	}
+	if c.isPrimary() {
+		return combineSecretEngineResourceCounts(m.LocalSecretEngineResourceCounts, m.ReplicatedSecretEngineResourceCounts)
+	}
+	return m.LocalSecretEngineResourceCounts
 }
 
 // GetKvUsageMetrics returns a map of namespace paths to KV secret counts.

@@ -1,15 +1,22 @@
-// Copyright IBM Corp. 2016, 2025
+// Copyright IBM Corp. 2016, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package aws
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/hashicorp/vault/internalshared/namespace"
 	"github.com/hashicorp/vault/sdk/helper/automatedrotationutil"
 	"github.com/hashicorp/vault/sdk/helper/pluginidentityutil"
 	"github.com/hashicorp/vault/sdk/helper/pluginutil"
@@ -20,6 +27,94 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestBackend_NoRootIMDSSTSConnectionReuse verifies that, without root configuration,
+// IMDS credentials are cached and separate AssumeRole calls reuse the STS connection.
+func TestBackend_NoRootIMDSSTSConnectionReuse(t *testing.T) {
+	// SDK configuration reads process-wide environment variables, so this test cannot run in parallel.
+	t.Setenv("AWS_CONFIG_FILE", t.TempDir()+"/config")
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", t.TempDir()+"/credentials")
+	t.Setenv("AWS_REGION", "us-east-1")
+	for _, key := range []string{
+		"AWS_PROFILE", "AWS_DEFAULT_PROFILE",
+		"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+		"AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+	} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "false")
+	t.Setenv("AWS_EC2_METADATA_V1_DISABLED", "true")
+
+	var credentialFetches atomic.Int32
+	imds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/latest/api/token" {
+			assert.Equal(t, http.MethodPut, r.Method)
+			w.Header().Set("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+			fmt.Fprint(w, "test-imds-token")
+			return
+		}
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "test-imds-token", r.Header.Get("X-aws-ec2-metadata-token"))
+		switch r.URL.Path {
+		case "/latest/meta-data/iam/security-credentials/":
+			fmt.Fprint(w, "test-instance-role")
+		case "/latest/meta-data/iam/security-credentials/test-instance-role":
+			credentialFetches.Add(1)
+			fmt.Fprintf(w, `{"Code":"Success","AccessKeyId":"imds-access","SecretAccessKey":"imds-secret","Token":"imds-session","Expiration":%q}`,
+				time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+		default:
+			http.Error(w, "unexpected metadata path", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(imds.Close)
+	t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", imds.URL)
+
+	var connections, calls atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Contains(t, r.Header.Get("Authorization"), "Credential=imds-access/")
+		assert.Equal(t, "imds-session", r.Header.Get("X-Amz-Security-Token"))
+		if assert.NoError(t, r.ParseForm()) {
+			assert.Equal(t, "AssumeRole", r.Form.Get("Action"))
+		}
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/xml")
+		fmt.Fprint(w, `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>test-access</AccessKeyId><SecretAccessKey>test-secret</SecretAccessKey><SessionToken>test-token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>`)
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
+	server.Start()
+	t.Cleanup(server.Close)
+
+	conf := logical.TestBackendConfig()
+	b := Backend(conf)
+	b.clientMutex.RLock()
+	configs, err := b.getRootSTSConfigs(t.Context(), &logical.InmemStorage{}, conf.Logger)
+	b.clientMutex.RUnlock()
+	require.NoError(t, err, "no-root STS configuration must load")
+	require.Len(t, configs, 1, "no-root path must return one configuration")
+	client, ok := configs[0].HTTPClient.(*http.Client)
+	require.True(t, ok, "SDK configuration must retain the HTTP client")
+	t.Cleanup(client.CloseIdleConnections)
+
+	// Redirect only STS; leave the IMDS credential chain and pooled transport intact.
+	configs[0].BaseEndpoint = aws.String(server.URL)
+	stsClient := sts.NewFromConfig(*configs[0])
+	for range 2 {
+		response, err := stsClient.AssumeRole(t.Context(), &sts.AssumeRoleInput{
+			RoleArn:         aws.String("arn:aws:iam::123456789012:role/test"),
+			RoleSessionName: aws.String("connection-reuse-test"),
+		})
+		require.NoError(t, err, "each STS call must succeed")
+		require.NotNil(t, response.Credentials, "each STS call must return credentials")
+	}
+	require.EqualValues(t, 2, calls.Load(), "issued credentials must not be cached")
+	require.EqualValues(t, 1, connections.Load(), "both STS calls must reuse one TCP connection")
+	require.EqualValues(t, 1, credentialFetches.Load(), "source IMDS credentials must be cached across STS calls")
+}
+
 func TestBackend_PathConfigRoot(t *testing.T) {
 	config := logical.TestBackendConfig()
 	config.StorageView = &logical.InmemStorage{}
@@ -27,7 +122,7 @@ func TestBackend_PathConfigRoot(t *testing.T) {
 	or := observations.NewTestObservationRecorder()
 	config.ObservationRecorder = or
 	b := Backend(config)
-	if err := b.Setup(context.Background(), config); err != nil {
+	if err := b.Setup(t.Context(), config); err != nil {
 		t.Fatal(err)
 	}
 
@@ -58,13 +153,13 @@ func TestBackend_PathConfigRoot(t *testing.T) {
 		Data:      configData,
 	}
 
-	resp, err := b.HandleRequest(context.Background(), configReq)
+	resp, err := b.HandleRequest(t.Context(), configReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: config writing failed: resp:%#v\n err: %v", resp, err)
 	}
 
 	require.Equal(t, 1, or.NumObservationsByType(ObservationTypeAWSRootConfigWrite))
-	resp, err = b.HandleRequest(context.Background(), &logical.Request{
+	resp, err = b.HandleRequest(t.Context(), &logical.Request{
 		Operation: logical.ReadOperation,
 		Storage:   config.StorageView,
 		Path:      "config/root",
@@ -113,13 +208,13 @@ func TestBackend_PathConfigRoot(t *testing.T) {
 		Data:      configData,
 	}
 
-	resp, err = b.HandleRequest(context.Background(), configReq)
+	resp, err = b.HandleRequest(t.Context(), configReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: config writing failed: resp:%#v\n err: %v", resp, err)
 	}
 	require.Equal(t, 2, or.NumObservationsByType(ObservationTypeAWSRootConfigWrite))
 
-	resp, err = b.HandleRequest(context.Background(), &logical.Request{
+	resp, err = b.HandleRequest(t.Context(), &logical.Request{
 		Operation: logical.ReadOperation,
 		Storage:   config.StorageView,
 		Path:      "config/root",
@@ -145,7 +240,7 @@ func TestBackend_PathConfigRoot_STSFallback(t *testing.T) {
 	config.ObservationRecorder = or
 
 	b := Backend(config)
-	if err := b.Setup(context.Background(), config); err != nil {
+	if err := b.Setup(t.Context(), config); err != nil {
 		t.Fatal(err)
 	}
 
@@ -176,13 +271,13 @@ func TestBackend_PathConfigRoot_STSFallback(t *testing.T) {
 		Data:      configData,
 	}
 
-	resp, err := b.HandleRequest(context.Background(), configReq)
+	resp, err := b.HandleRequest(t.Context(), configReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: config writing failed: resp:%#v\n err: %v", resp, err)
 	}
 
 	require.Equal(t, 1, or.NumObservationsByType(ObservationTypeAWSRootConfigWrite))
-	resp, err = b.HandleRequest(context.Background(), &logical.Request{
+	resp, err = b.HandleRequest(t.Context(), &logical.Request{
 		Operation: logical.ReadOperation,
 		Storage:   config.StorageView,
 		Path:      "config/root",
@@ -228,13 +323,13 @@ func TestBackend_PathConfigRoot_STSFallback(t *testing.T) {
 		Data:      configData,
 	}
 
-	resp, err = b.HandleRequest(context.Background(), configReq)
+	resp, err = b.HandleRequest(t.Context(), configReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: config writing failed: resp:%#v\n err: %v", resp, err)
 	}
 
 	require.Equal(t, 2, or.NumObservationsByType(ObservationTypeAWSRootConfigWrite))
-	resp, err = b.HandleRequest(context.Background(), &logical.Request{
+	resp, err = b.HandleRequest(t.Context(), &logical.Request{
 		Operation: logical.ReadOperation,
 		Storage:   config.StorageView,
 		Path:      "config/root",
@@ -266,7 +361,7 @@ func TestBackend_PathConfigRoot_STSFallback_mismatchedfallback(t *testing.T) {
 	config.ObservationRecorder = or
 
 	b := Backend(config)
-	if err := b.Setup(context.Background(), config); err != nil {
+	if err := b.Setup(t.Context(), config); err != nil {
 		t.Fatal(err)
 	}
 
@@ -294,7 +389,7 @@ func TestBackend_PathConfigRoot_STSFallback_mismatchedfallback(t *testing.T) {
 		Data:      configData,
 	}
 
-	resp, err := b.HandleRequest(context.Background(), configReq)
+	resp, err := b.HandleRequest(t.Context(), configReq)
 	if err != nil {
 		t.Fatalf("bad: config writing failed: err: %v", err)
 	}
@@ -313,7 +408,7 @@ func TestBackend_PathConfigRoot_STSFallback_defaultEndpointRegion(t *testing.T) 
 	config.ObservationRecorder = or
 
 	b := Backend(config)
-	if err := b.Setup(context.Background(), config); err != nil {
+	if err := b.Setup(t.Context(), config); err != nil {
 		t.Fatal(err)
 	}
 
@@ -334,12 +429,12 @@ func TestBackend_PathConfigRoot_STSFallback_defaultEndpointRegion(t *testing.T) 
 		Data:      configData,
 	}
 
-	_, err := b.HandleRequest(context.Background(), configReq)
+	_, err := b.HandleRequest(t.Context(), configReq)
 	if err != nil {
 		t.Fatalf("bad: config writing failed: err: %v", err)
 	}
 
-	cfgs, err := b.getRootSTSConfigs(context.Background(), config.StorageView, b.Logger())
+	cfgs, err := b.getRootSTSConfigs(t.Context(), config.StorageView, b.Logger())
 	if err != nil {
 		t.Fatalf("couldn't get STS configs with default region/endpoints: %v", err)
 	}
@@ -347,8 +442,8 @@ func TestBackend_PathConfigRoot_STSFallback_defaultEndpointRegion(t *testing.T) 
 		t.Fatalf("got %d configs, but expected 1", len(cfgs))
 	} else {
 		cfg := cfgs[0]
-		if *(cfg.Endpoint) != matchingSTSEndpoint(*(cfg.Region)) {
-			t.Fatalf("region and endpoint didn't match: %s vs. %s", *(cfg.Region), *(cfg.Endpoint))
+		if aws.ToString(cfg.BaseEndpoint) != matchingSTSEndpoint(cfg.Region) {
+			t.Fatalf("region and endpoint didn't match: %s vs. %s", cfg.Region, aws.ToString(cfg.BaseEndpoint))
 		}
 	}
 	require.Equal(t, 1, or.NumObservationsByType(ObservationTypeAWSRootConfigWrite))
@@ -364,7 +459,7 @@ func TestBackend_PathConfigRoot_IAM_specifiedRegion(t *testing.T) {
 	config.ObservationRecorder = or
 
 	b := Backend(config)
-	if err := b.Setup(context.Background(), config); err != nil {
+	if err := b.Setup(t.Context(), config); err != nil {
 		t.Fatal(err)
 	}
 
@@ -388,21 +483,21 @@ func TestBackend_PathConfigRoot_IAM_specifiedRegion(t *testing.T) {
 		Data:      configData,
 	}
 
-	_, err := b.HandleRequest(context.Background(), configReq)
+	_, err := b.HandleRequest(t.Context(), configReq)
 	if err != nil {
 		t.Fatalf("bad: config writing failed: err: %v", err)
 	}
 
 	require.Equal(t, 1, or.NumObservationsByType(ObservationTypeAWSRootConfigWrite))
-	cfg, err := b.getRootIAMConfig(context.Background(), config.StorageView, b.Logger())
+	cfg, err := b.getRootIAMConfig(t.Context(), config.StorageView, b.Logger())
 	if err != nil {
 		t.Fatalf("couldn't get IAM configs with default region/endpoints: %v", err)
 	}
-	if *(cfg.Endpoint) != "" {
-		t.Fatalf("endpoint should have remained blank but it became %s", *(cfg.Endpoint))
+	if aws.ToString(cfg.BaseEndpoint) != "" {
+		t.Fatalf("endpoint should have remained blank but it became %s", aws.ToString(cfg.BaseEndpoint))
 	}
-	if *(cfg.Region) != desiredRegion {
-		t.Fatalf("region changed from config: %s became %s", desiredRegion, *(cfg.Region))
+	if cfg.Region != desiredRegion {
+		t.Fatalf("region changed from config: %s became %s", desiredRegion, cfg.Region)
 	}
 }
 
@@ -416,7 +511,7 @@ func TestBackend_PathConfigRoot_IAM_specifiedRegionAndEndpoint(t *testing.T) {
 	config.ObservationRecorder = or
 
 	b := Backend(config)
-	if err := b.Setup(context.Background(), config); err != nil {
+	if err := b.Setup(t.Context(), config); err != nil {
 		t.Fatal(err)
 	}
 
@@ -442,22 +537,22 @@ func TestBackend_PathConfigRoot_IAM_specifiedRegionAndEndpoint(t *testing.T) {
 		Data:      configData,
 	}
 
-	_, err := b.HandleRequest(context.Background(), configReq)
+	_, err := b.HandleRequest(t.Context(), configReq)
 	if err != nil {
 		t.Fatalf("bad: config writing failed: err: %v", err)
 	}
 
 	require.Equal(t, 1, or.NumObservationsByType(ObservationTypeAWSRootConfigWrite))
-	cfg, err := b.getRootIAMConfig(context.Background(), config.StorageView, b.Logger())
+	cfg, err := b.getRootIAMConfig(t.Context(), config.StorageView, b.Logger())
 	if err != nil {
 		t.Fatalf("couldn't get IAM configs with default region/endpoints: %v", err)
 	}
 
-	if *(cfg.Endpoint) != desiredEndpoint {
-		t.Fatalf("endpoint should have been %s but it became %s", desiredEndpoint, *(cfg.Endpoint))
+	if aws.ToString(cfg.BaseEndpoint) != desiredEndpoint {
+		t.Fatalf("endpoint should have been %s but it became %s", desiredEndpoint, aws.ToString(cfg.BaseEndpoint))
 	}
-	if *(cfg.Region) != desiredRegion {
-		t.Fatalf("region changed from config: %s became %s", desiredRegion, *(cfg.Region))
+	if cfg.Region != desiredRegion {
+		t.Fatalf("region changed from config: %s became %s", desiredRegion, cfg.Region)
 	}
 }
 
@@ -471,7 +566,7 @@ func TestBackend_PathConfigRoot_IAM_defaultEndpointRegion(t *testing.T) {
 	config.ObservationRecorder = or
 
 	b := Backend(config)
-	if err := b.Setup(context.Background(), config); err != nil {
+	if err := b.Setup(t.Context(), config); err != nil {
 		t.Fatal(err)
 	}
 
@@ -492,19 +587,19 @@ func TestBackend_PathConfigRoot_IAM_defaultEndpointRegion(t *testing.T) {
 		Data:      configData,
 	}
 
-	_, err := b.HandleRequest(context.Background(), configReq)
+	_, err := b.HandleRequest(t.Context(), configReq)
 	if err != nil {
 		t.Fatalf("bad: config writing failed: err: %v", err)
 	}
 
 	require.Equal(t, 1, or.NumObservationsByType(ObservationTypeAWSRootConfigWrite))
-	cfg, err := b.getRootIAMConfig(context.Background(), config.StorageView, b.Logger())
+	cfg, err := b.getRootIAMConfig(t.Context(), config.StorageView, b.Logger())
 	if err != nil {
 		t.Fatalf("couldn't get IAM configs with default region/endpoints: %v", err)
 	}
 	// ensure endpoint is blank, because AWS wants that
-	if *(cfg.Endpoint) != "" {
-		t.Fatalf("expected endpoint to be blank but it was %s", *(cfg.Endpoint))
+	if aws.ToString(cfg.BaseEndpoint) != "" {
+		t.Fatalf("expected endpoint to be blank but it was %s", aws.ToString(cfg.BaseEndpoint))
 	}
 }
 
@@ -518,7 +613,7 @@ func TestBackend_PathConfigRoot_STSIAM_SetEverything(t *testing.T) {
 	config.ObservationRecorder = or
 
 	b := Backend(config)
-	if err := b.Setup(context.Background(), config); err != nil {
+	if err := b.Setup(t.Context(), config); err != nil {
 		t.Fatal(err)
 	}
 
@@ -548,27 +643,27 @@ func TestBackend_PathConfigRoot_STSIAM_SetEverything(t *testing.T) {
 		Data:      configData,
 	}
 
-	_, err := b.HandleRequest(context.Background(), configReq)
+	_, err := b.HandleRequest(t.Context(), configReq)
 	if err != nil {
 		t.Fatalf("bad: config writing failed: err: %v", err)
 	}
 
 	require.Equal(t, 1, or.NumObservationsByType(ObservationTypeAWSRootConfigWrite))
 	// get IAM
-	cfg, err := b.getRootIAMConfig(context.Background(), config.StorageView, b.Logger())
+	cfg, err := b.getRootIAMConfig(t.Context(), config.StorageView, b.Logger())
 	if err != nil {
 		t.Fatalf("couldn't get IAM configs with default region/endpoints: %v", err)
 	}
 
-	if *(cfg.Endpoint) != "" {
-		t.Fatalf("endpoint should have remained blank but it became %s", *(cfg.Endpoint))
+	if aws.ToString(cfg.BaseEndpoint) != "" {
+		t.Fatalf("endpoint should have remained blank but it became %s", aws.ToString(cfg.BaseEndpoint))
 	}
-	if *(cfg.Region) != desiredRegion {
-		t.Fatalf("region changed from config: %s became %s", desiredRegion, *(cfg.Region))
+	if cfg.Region != desiredRegion {
+		t.Fatalf("region changed from config: %s became %s", desiredRegion, cfg.Region)
 	}
 
 	// get STS
-	cfgs, err := b.getRootSTSConfigs(context.Background(), config.StorageView, b.Logger())
+	cfgs, err := b.getRootSTSConfigs(t.Context(), config.StorageView, b.Logger())
 	if err != nil {
 		t.Fatalf("couldn't get IAM configs with default region/endpoints: %v", err)
 	}
@@ -587,7 +682,7 @@ func TestBackend_PathConfigRoot_PluginIdentityToken(t *testing.T) {
 	config.ObservationRecorder = or
 
 	b := Backend(config)
-	if err := b.Setup(context.Background(), config); err != nil {
+	if err := b.Setup(t.Context(), config); err != nil {
 		t.Fatal(err)
 	}
 
@@ -604,7 +699,7 @@ func TestBackend_PathConfigRoot_PluginIdentityToken(t *testing.T) {
 		Data:      configData,
 	}
 
-	resp, err := b.HandleRequest(context.Background(), configReq)
+	resp, err := b.HandleRequest(t.Context(), configReq)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
 	assert.ErrorContains(t, resp.Error(), pluginidentityutil.ErrPluginWorkloadIdentityUnsupported.Error())
@@ -620,7 +715,7 @@ func TestBackend_PathConfigRoot_RegisterRootRotation(t *testing.T) {
 	or := observations.NewTestObservationRecorder()
 	config.ObservationRecorder = or
 
-	nsCtx := namespace.ContextWithNamespace(context.Background(), namespace.RootNamespace)
+	nsCtx := namespace.ContextWithNamespace(t.Context(), namespace.RootNamespace)
 
 	b := Backend(config)
 	if err := b.Setup(nsCtx, config); err != nil {
@@ -641,7 +736,7 @@ func TestBackend_PathConfigRoot_RegisterRootRotation(t *testing.T) {
 		Data:      configData,
 	}
 
-	resp, err := b.HandleRequest(context.Background(), configReq)
+	resp, err := b.HandleRequest(t.Context(), configReq)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
 	assert.ErrorContains(t, resp.Error(), automatedrotationutil.ErrRotationManagerUnsupported.Error())

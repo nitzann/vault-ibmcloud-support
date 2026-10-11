@@ -10,8 +10,6 @@ import (
 	"fmt"
 )
 
-//go:generate go run github.com/hashicorp/vault/tools/stubmaker
-
 func (c *Core) entInitWALPassThrough() func() {
 	return nil
 }
@@ -129,6 +127,8 @@ func (c *Core) GetReplicationLagMillisIgnoreErrs() int64 { return 0 }
 func (c *Core) ReloadOverloadController() {}
 
 func (c *Core) EntSetupUIDefaultAuth(ctx context.Context) error { return nil }
+
+func (c *Core) EntSetupUIChecklistState() {}
 
 // entGetPluginCacheDir returns empty string and an error indicating that this is an
 // enterprise-only feature. This is used to prevent the use of the plugin cache

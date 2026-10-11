@@ -5,7 +5,6 @@ package audit
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -17,7 +16,7 @@ import (
 	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/hashicorp/eventlogger"
 	"github.com/hashicorp/go-hclog"
-	nshelper "github.com/hashicorp/vault/helper/namespace"
+	nshelper "github.com/hashicorp/vault/internalshared/namespace"
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
 	"github.com/hashicorp/vault/sdk/helper/salt"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -261,39 +260,31 @@ func mergeEnterpriseTokenMetadata(a *auth, req *logical.Request) error {
 		return nil
 	}
 
-	if req.EnterpriseTokenMetadata == "" &&
-		req.EnterpriseTokenIssuer == "" &&
-		req.EnterpriseTokenTransaction == "" &&
-		len(req.EnterpriseTokenAudience) == 0 &&
-		len(req.EnterpriseTokenAuthorizationDetails) == 0 {
+	if req.JwtUniqueId == "" &&
+		req.JwtIssuer == "" &&
+		req.JwtTransactionClaim == "" &&
+		len(req.JwtAudienceClaim) == 0 &&
+		len(req.JwtAuthorizationDetails) == 0 {
 		return nil
 	}
 
 	if a.Metadata == nil {
-		a.Metadata = make(map[string]string)
+		a.Metadata = make(map[string]any)
 	}
-	if req.EnterpriseTokenMetadata != "" {
-		a.Metadata["enterprise_token_metadata"] = req.EnterpriseTokenMetadata
+	if req.JwtUniqueId != "" {
+		a.Metadata["jwt_unique_id"] = req.JwtUniqueId
 	}
-	if req.EnterpriseTokenIssuer != "" {
-		a.Metadata["enterprise_token_issuer"] = req.EnterpriseTokenIssuer
+	if req.JwtIssuer != "" {
+		a.Metadata["jwt_issuer"] = req.JwtIssuer
 	}
-	if req.EnterpriseTokenTransaction != "" {
-		a.Metadata["enterprise_token_transaction"] = req.EnterpriseTokenTransaction
+	if req.JwtTransactionClaim != "" {
+		a.Metadata["jwt_transaction_claim"] = req.JwtTransactionClaim
 	}
-	if len(req.EnterpriseTokenAudience) > 0 {
-		audJSON, err := json.Marshal(req.EnterpriseTokenAudience)
-		if err != nil {
-			return fmt.Errorf("unable to marshal enterprise token audience for audit: %w", err)
-		}
-		a.Metadata["enterprise_token_audience"] = string(audJSON)
+	if len(req.JwtAudienceClaim) > 0 {
+		a.Metadata["jwt_audience_claim"] = req.JwtAudienceClaim
 	}
-	if len(req.EnterpriseTokenAuthorizationDetails) > 0 {
-		authzJSON, err := json.Marshal(req.EnterpriseTokenAuthorizationDetails)
-		if err != nil {
-			return fmt.Errorf("unable to marshal enterprise token authorization details for audit: %w", err)
-		}
-		a.Metadata["enterprise_token_authorization_details"] = string(authzJSON)
+	if len(req.JwtAuthorizationDetails) > 0 {
+		a.Metadata["jwt_authorization_details"] = req.JwtAuthorizationDetails
 	}
 	return nil
 }
@@ -370,15 +361,31 @@ func newAuth(input *logical.Auth, tokenRemainingUses int) (*auth, error) {
 		tokenIssueTime = input.IssueTime.Format(time.RFC3339)
 	}
 
+	var metadataForAudit map[string]any
+	if metadata != nil {
+		metadataForAudit = make(map[string]any)
+		for k, v := range metadata {
+			metadataForAudit[k] = v
+		}
+	}
+	var authorizationDetails []any
+	if len(input.AuthorizationDetails) > 0 {
+		authorizationDetails = make([]any, len(input.AuthorizationDetails))
+		for i, detail := range input.AuthorizationDetails {
+			authorizationDetails[i] = detail
+		}
+	}
+
 	return &auth{
 		Accessor:                  input.Accessor,
+		AuthorizationDetails:      authorizationDetails,
 		ClientToken:               input.ClientToken,
 		DisplayName:               input.DisplayName,
 		EntityCreated:             input.EntityCreated,
 		EntityID:                  input.EntityID,
 		ExternalNamespacePolicies: extNSPolicies,
 		IdentityPolicies:          identityPolicies,
-		Metadata:                  metadata,
+		Metadata:                  metadataForAudit,
 		NoDefaultPolicy:           input.NoDefaultPolicy,
 		NumUses:                   input.NumUses,
 		Policies:                  policies,

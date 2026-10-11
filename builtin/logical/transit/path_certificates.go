@@ -6,12 +6,14 @@ package transit
 import (
 	"context"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/certutil"
 	"github.com/hashicorp/vault/sdk/helper/errutil"
 	"github.com/hashicorp/vault/sdk/helper/keysutil"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -133,7 +135,18 @@ func (b *backend) pathCreateCsrWrite(ctx context.Context, req *logical.Request, 
 		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
 	}
 
-	pemCsr, err := p.CreateCsr(signingKeyVersion, csrTemplate)
+	var createCsr keysutil.CsrCreator
+	if p.KeyVersionType(signingKeyVersion) == keysutil.KeyType_MANAGED_KEY {
+		factory, err := b.GetManagedKeyFactory(ctx)
+		if err != nil {
+			return nil, err
+		}
+		createCsr = p.CreateCsrWithManagedKeyVersion(factory.GetManagedKeyParameters())
+	} else {
+		createCsr = p.CreateCsrWithKeyVersion
+	}
+
+	pemCsr, err := p.CreateCsr(signingKeyVersion, csrTemplate, createCsr)
 	if err != nil {
 		prefixedErr := fmt.Errorf("could not create the csr: %w", err)
 		switch err.(type) {
@@ -147,7 +160,7 @@ func (b *backend) pathCreateCsrWrite(ctx context.Context, req *logical.Request, 
 	resp := &logical.Response{
 		Data: map[string]interface{}{
 			"name": p.Name,
-			"type": p.Type.String(),
+			"type": p.KeyVersionType(signingKeyVersion).String(),
 			"csr":  string(pemCsr),
 		},
 	}
@@ -194,7 +207,22 @@ func (b *backend) pathImportCertChainWrite(ctx context.Context, req *logical.Req
 		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
 	}
 
-	err = p.ValidateAndPersistCertificateChain(ctx, keyVersion, certChain, req.Storage)
+	var validateKeyMatch keysutil.LeafCertKeyMatchValidator
+	if p.KeyVersionType(keyVersion) == keysutil.KeyType_MANAGED_KEY {
+		factory, err := b.GetManagedKeyFactory(ctx)
+		if err != nil {
+			return nil, err
+		}
+		validateKeyMatch = func(keyVersion int, certPublicKeyAlgorithm x509.PublicKeyAlgorithm, certPublicKey any) (bool, error) {
+			return p.ValidateLeafCertKeyMatchWithManagedKeyVersion(keyVersion, certPublicKeyAlgorithm, certPublicKey, factory.GetManagedKeyParameters())
+		}
+	} else {
+		validateKeyMatch = func(keyVersion int, certPublicKeyAlgorithm x509.PublicKeyAlgorithm, certPublicKey any) (bool, error) {
+			return p.ValidateLeafCertKeyMatchWithNativeKeyVersion(keyVersion, certPublicKeyAlgorithm, certPublicKey)
+		}
+	}
+
+	err = p.ValidateAndPersistCertificateChain(ctx, keyVersion, certChain, validateKeyMatch, req.Storage)
 	if err != nil {
 		prefixedErr := fmt.Errorf("failed to persist certificate chain: %w", err)
 		switch err.(type) {
@@ -208,7 +236,7 @@ func (b *backend) pathImportCertChainWrite(ctx context.Context, req *logical.Req
 	resp := &logical.Response{
 		Data: map[string]interface{}{
 			"name":              p.Name,
-			"type":              p.Type.String(),
+			"type":              p.KeyVersionType(keyVersion).String(),
 			"certificate-chain": pemCertChain,
 		},
 	}
@@ -230,6 +258,28 @@ func parseCsr(csrStr string) (*x509.CertificateRequest, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Drop extensionRequest so CreateCertificateRequest uses the pkix.Extension
+	// path, which preserves Critical. Other attributes (e.g. challengePassword) stay.
+	var filtered []pkix.AttributeTypeAndValueSET
+	for _, attr := range csr.Attributes {
+		if !attr.Type.Equal(certutil.OidExtensionRequest) {
+			filtered = append(filtered, attr)
+		}
+	}
+	csr.Attributes = filtered
+
+	// Copy extensions verbatim into ExtraExtensions so the raw SAN blob
+	// (including otherName/UPN) is preserved. CreateCertificateRequest won't
+	// auto-generate a SAN when the OID is already in ExtraExtensions, so no
+	// duplicate is emitted.
+	csr.ExtraExtensions = append(csr.ExtraExtensions, csr.Extensions...)
+
+	// Clear SAN struct fields since SAN is now carried by ExtraExtensions.
+	csr.DNSNames = nil
+	csr.EmailAddresses = nil
+	csr.IPAddresses = nil
+	csr.URIs = nil
 
 	return csr, nil
 }

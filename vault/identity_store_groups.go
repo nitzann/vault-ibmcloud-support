@@ -12,8 +12,9 @@ import (
 	"github.com/golang/protobuf/ptypes"
 	"github.com/hashicorp/go-secure-stdlib/strutil"
 	"github.com/hashicorp/vault/helper/identity"
-	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/internalshared/namespace"
 	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/policyutil"
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
@@ -286,7 +287,15 @@ func (i *IdentityStore) handleGroupUpdateCommon(ctx context.Context, req *logica
 	// Update the policies if supplied
 	policiesRaw, ok := d.GetOk("policies")
 	if ok {
-		dedupedPolicies := strutil.RemoveDuplicatesStable(policiesRaw.([]string), true)
+		validatedPolicies := make([]string, 0, len(policiesRaw.([]string)))
+		for _, policy := range policiesRaw.([]string) {
+			canonicalPolicy, err := policyutil.ValidatePolicyName(policy)
+			if err != nil {
+				return logical.ErrorResponse(fmt.Sprintf("invalid policy name %q: %s", policy, err)), nil
+			}
+			validatedPolicies = append(validatedPolicies, canonicalPolicy)
+		}
+		dedupedPolicies := strutil.RemoveDuplicatesStable(validatedPolicies, false)
 		if !strutil.EquivalentSlices(dedupedPolicies, group.Policies) {
 			modifiedFields = append(modifiedFields, "policies")
 		}
@@ -454,7 +463,7 @@ func (i *IdentityStore) handleGroupReadCommon(ctx context.Context, group *identi
 		return nil, err
 	}
 	if ns.ID != group.NamespaceID {
-		return logical.ErrorResponse("request namespace is not the same as the group namespace"), logical.ErrPermissionDenied
+		return nil, nil
 	}
 
 	respData := map[string]interface{}{}
@@ -470,9 +479,7 @@ func (i *IdentityStore) handleGroupReadCommon(ctx context.Context, group *identi
 	respData["type"] = group.Type
 	respData["namespace_id"] = group.NamespaceID
 
-	if i.scimEnabled {
-		respData["scim_client_id"] = group.ScimClientID
-	}
+	respData["scim_client_id"] = group.ScimClientID
 
 	aliasMap := map[string]interface{}{}
 	if group.Alias != nil {
@@ -566,7 +573,7 @@ func (i *IdentityStore) handleGroupDeleteCommon(ctx context.Context, key string,
 		return nil, err
 	}
 	if group.NamespaceID != ns.ID {
-		return logical.ErrorResponse("request namespace is not the same as the group namespace"), logical.ErrPermissionDenied
+		return nil, nil
 	}
 
 	scimID := scimClientIDFromContext(ctx)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright IBM Corp. 2016, 2025
+# Copyright IBM Corp. 2016, 2026
 # SPDX-License-Identifier: BUSL-1.1
 
 set -euo pipefail
@@ -62,6 +62,11 @@ fi
 echo "All required dependencies are available."
 pushd "$root_dir" > /dev/null
 
+# Disable workspace mode so tests resolve against the module's own go.mod
+# rather than the workspace, ensuring deps are resolvable without private
+# workspace credentials.
+export GOWORK=off
+
 # Create unique output files for test results
 timestamp="$(date +%s)_$$"
 json_output="/tmp/vault_test_results_${timestamp}.json"
@@ -76,6 +81,12 @@ echo "JUnit results will be written to: $junit_output"
 echo "Running tests..."
 echo "Vault environment variables:"
 env | grep VAULT | sed 's/VAULT_TOKEN=.*/VAULT_TOKEN=***REDACTED***/'
+echo ""
+echo "=== VAULT_ADDR Configuration Debug ==="
+echo "VAULT_ADDR_DEBUG: ${VAULT_ADDR_DEBUG:-not set}"
+echo "Final VAULT_ADDR: ${VAULT_ADDR}"
+echo "======================================"
+echo ""
 
 # For HTTP Vault addresses, inherited TLS CA settings can point to stale temp files.
 # TODO: Investigate why TLS CA env vars persist for HTTP Vault connections and remove this workaround after fixing root cause.
@@ -83,22 +94,109 @@ if [[ "${VAULT_ADDR}" == http://* ]]; then
     unset VAULT_CACERT VAULT_CAPATH
 fi
 
+# Determine base tags based on edition
 case $VAULT_EDITION in
-    ent | ent.hsm | ent.hsm.fips1402 | ent.hsm.fips1403 | ent.fips1403 | ent.fips1402)
-        tags="-tags=ent,enterprise"
+    ent.hsm.fips1403)
+        base_tags="ent,enterprise,cgo,hsm,fips,fips_140_3"
+        ;;
+    ent.hsm.fips1402)
+        base_tags="ent,enterprise,cgo,hsm,fips,fips_140_2"
+        ;;
+    ent.hsm)
+        base_tags="ent,enterprise,cgo,hsm,venthsm"
+        ;;
+    ent.fips1403)
+        base_tags="ent,enterprise,cgo,hsm,fips,fips_140_3"
+        ;;
+    ent.fips1402)
+        base_tags="ent,enterprise,cgo,hsm,fips,fips_140_2"
+        ;;
+    ent)
+        base_tags="ent,enterprise"
         ;;
     ce)
-        tags=""
+        base_tags=""
         ;;
     *)
         fail "unknown VAULT_EDITION: $VAULT_EDITION"
         ;;
 esac
 
+# Add build tags based on test package paths (handle multiple categories)
+category_tags=""
+if [[ "$VAULT_TEST_PACKAGE" == *"/isolated/"* ]]; then
+    # Skip isolated tests on CE - they require namespaces which are enterprise-only
+    if [[ "$VAULT_EDITION" == "ce" ]]; then
+        echo "Skipping isolated tests on CE edition (requires enterprise features like namespaces)"
+        exit 0
+  fi
+    category_tags="isolated"
+fi
+if [[ "$VAULT_TEST_PACKAGE" == *"/scenario/"* ]]; then
+    category_tags="${category_tags:+${category_tags},}scenario"
+fi
+if [[ "$VAULT_TEST_PACKAGE" == *"/system/"* ]]; then
+    category_tags="${category_tags:+${category_tags},}system"
+fi
+# Add testonly tag when ENABLE_TESTONLY_TESTS is set (for verify tests)
+if [[ "${ENABLE_TESTONLY_TESTS:-}" == "true" ]]; then
+    category_tags="${category_tags:+${category_tags},}testonly"
+fi
+
+# Combine tags
+if [[ -n "$base_tags" && -n "$category_tags" ]]; then
+    tags="-tags=${base_tags},${category_tags}"
+elif [[ -n "$base_tags" ]]; then
+    tags="-tags=${base_tags}"
+elif [[ -n "$category_tags" ]]; then
+    tags="-tags=${category_tags}"
+else
+    tags=""
+fi
+
 # Build gotestsum command based on whether we have specific tests
 # Convert VAULT_TEST_PACKAGE to array to handle multiple package paths properly
 VAULT_TEST_PACKAGE=$(printf "%s" "$VAULT_TEST_PACKAGE")
 IFS=' ' read -r -a packages <<< "$VAULT_TEST_PACKAGE"
+
+# Calculate test timeout based on number of tests
+# Default: 25 seconds per test, with minimum of 5 minutes, fallback to 60 minutes
+if [ -z "${VAULT_TEST_TIMEOUT:-}" ]; then
+  echo "Calculating test timeout based on test count..."
+
+  # Count test functions in the packages
+  test_count=0
+  for pkg in "${packages[@]}"; do
+    # Convert package path to file system path and count Test functions
+    pkg_path="${pkg#./}"
+    if [ -d "$pkg_path" ]; then
+      # Count functions starting with "func Test" in all _test.go files
+      count=$(find "$pkg_path" -name "*_test.go" -type f -exec grep -h "^func Test" {} \; 2> /dev/null | wc -l)
+      test_count=$((test_count + count))
+    fi
+  done
+
+  if [ "$test_count" -gt 0 ]; then
+    # Calculate timeout: 25 seconds per test, converted to minutes
+    timeout_seconds=$((test_count * 25))
+    timeout_minutes=$((timeout_seconds / 60))
+
+    # Set minimum timeout of 5 minutes
+    if [ "$timeout_minutes" -lt 5 ]; then
+      timeout_minutes=5
+    fi
+
+    test_timeout="${timeout_minutes}m"
+    echo "Found $test_count tests, calculated timeout: $test_timeout (${timeout_seconds}s total)"
+  else
+    # Fallback if we can't count tests - use 60 minutes default
+    test_timeout="60m"
+    echo "Could not count tests, using default timeout: $test_timeout"
+  fi
+else
+    test_timeout="$VAULT_TEST_TIMEOUT"
+    echo "Using provided VAULT_TEST_TIMEOUT: $test_timeout"
+fi
 
 set -x # Show commands being executed
 set +e # Temporarily disable exit on error
@@ -107,10 +205,10 @@ if [ -n "$VAULT_TEST_MATRIX" ] && [ -f "$VAULT_TEST_MATRIX" ]; then
     # Extract test names from matrix and create regex pattern
     test_pattern=$(jq -r '[.include[].test] | join("|")' "$VAULT_TEST_MATRIX")
     echo "Running specific tests: $test_pattern"
-    gotestsum --junitfile="$junit_output" --format=standard-verbose --jsonfile="$json_output" -- -count=1 "${tags}" -run="$test_pattern" "${packages[@]}"
+    gotestsum --junitfile="$junit_output" --format=standard-verbose --jsonfile="$json_output" -- -timeout="$test_timeout" -count=1 "${tags}" -run="$test_pattern" "${packages[@]}"
 else
     echo "Running all tests in package"
-    gotestsum --junitfile="$junit_output" --format=standard-verbose --jsonfile="$json_output" -- -count=1 "${tags}" "${packages[@]}"
+    gotestsum --junitfile="$junit_output" --format=standard-verbose --jsonfile="$json_output" -- -timeout="$test_timeout" -count=1 "${tags}" "${packages[@]}"
 fi
 test_exit_code=$?
 set -e # Re-enable exit on error
@@ -140,6 +238,7 @@ else
 fi
 
 # Also output human-readable results to stdout
+echo ""
 echo "=== TEST EXECUTION SUMMARY ==="
 if [ $test_exit_code -eq 0 ]; then
     echo "✅ Tests PASSED"
@@ -148,6 +247,7 @@ else
 fi
 
 # Parse JSON results and create a summary
+echo ""
 echo "=== DETAILED RESULTS ==="
 if [ -f "$json_output" ] && [ -s "$json_output" ]; then
     if command -v jq &> /dev/null; then
@@ -182,6 +282,56 @@ fi
 if [ -f "$json_output" ] && [ -s "$json_output" ]; then
     echo "JSON_RESULTS_FILE=$json_output"
 fi
+
+# Print the equivalent standalone go test command so it can be copied and run outside of Enos.
+# Each env var is printed on its own line with a trailing backslash so the whole block
+# can be selected and pasted directly into a terminal.
+#
+# Env vars included:
+#   - All VAULT_* except enos-internal plumbing (VAULT_TEST_*, VAULT_ADDR_DEBUG)
+#   - Integration vars (LDAP_*, PG*, POSTGRES_*, MONGO_*)
+#   - Verify-test scalars (EXPECTED_STATE, TIMEOUT_SECONDS, RETRY_INTERVAL, DEFAULT_LCQ)
+
+# Collect relevant env vars, one per line, redacting secrets
+env_lines=()
+while IFS= read -r line; do
+    env_lines+=("$line")
+done < <(env \
+    | grep -E '^(VAULT_|LDAP_|PG|POSTGRES_|MONGO_|EXPECTED_STATE=|TIMEOUT_SECONDS=|RETRY_INTERVAL=|DEFAULT_LCQ=)' \
+    | grep -v -E '^(VAULT_TEST_|VAULT_ADDR_DEBUG=)' \
+    | sed 's/^\(VAULT_TOKEN=\).*/\1***REDACTED***/' \
+    | sed 's/^\(VAULT_LICENSE=\).*/\1***REDACTED***/' \
+    | sed 's/^\(VAULT_LICENSE_IBM=\).*/\1***REDACTED***/' \
+    | sort)
+
+# Reconstruct the -run filter from the matrix if one was used
+run_filter=""
+if [ -n "${VAULT_TEST_MATRIX:-}" ] && [ -f "${VAULT_TEST_MATRIX}" ]; then
+    run_filter="-run=\"$(jq -r '[.include[].test] | join("|")' "$VAULT_TEST_MATRIX")\""
+fi
+
+# Building Blackbox Test Command. Build the pretty multi-line command string
+cmd_lines=()
+for line in "${env_lines[@]}"; do
+    cmd_lines+=("  ${line} \\")
+done
+cmd_lines+=("  GOWORK=off go test -count=1 -timeout=${test_timeout} \\")
+[[ -n "${tags}" ]]       && cmd_lines+=("    ${tags} \\")
+[[ -n "${run_filter}" ]] && cmd_lines+=("    ${run_filter} \\")
+# Last line: package with no trailing backslash
+cmd_lines+=("    ${VAULT_TEST_PACKAGE}")
+
+# Join into a single display string
+pretty_cmd="$(printf '%s\n' "${cmd_lines[@]}")"
+
+echo ""
+echo "=== BLACKBOX TEST COMMAND ==="
+echo "${pretty_cmd}"
+echo "============================="
+
+# Emit a single-line base64-encoded marker so Terraform can capture the command
+# via regex() and expose it as an `enos scenario output` value.
+echo "BLACKBOX_TEST_CMD=$(echo "${pretty_cmd}" | base64 -w 0)"
 
 popd > /dev/null
 

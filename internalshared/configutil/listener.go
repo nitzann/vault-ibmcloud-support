@@ -20,13 +20,29 @@ import (
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/hashicorp/hcl/hcl/token"
-	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/internalshared/namespace"
 )
 
 const (
 	TCP  ListenerType = "tcp"
 	Unix ListenerType = "unix"
 )
+
+// minTLSReloadInterval is the smallest permitted value for tls_reload_interval.
+// Polling more frequently than this provides no practical benefit and only adds
+// filesystem load, since certificate rotation happens on the order of days.
+const minTLSReloadInterval = 1 * time.Second
+
+// maxTLSReloadInterval is the largest permitted value for tls_reload_interval.
+//
+// The interval is the worst-case delay between a rotated certificate appearing
+// on disk and Vault serving it, so an interval longer than the window between
+// rotation and expiry defeats the purpose of automatic reloading: the listener
+// would keep serving a certificate that has already expired and reject new
+// connections until the next poll. A day is far longer than any practical
+// rotation overlap while still catching obvious misconfiguration, such as a
+// unit mix-up that yields an interval of months.
+const maxTLSReloadInterval = 24 * time.Hour
 
 // ListenerType represents the supported types of listener.
 type ListenerType string
@@ -82,6 +98,12 @@ type Listener struct {
 	TLSDisableClientCerts            bool        `hcl:"-"`
 	TLSDisableClientCertsRaw         interface{} `hcl:"tls_disable_client_certs"`
 
+	// TLSReloadInterval controls how often the listener re-reads tls_cert_file
+	// and tls_key_file from disk. A zero value disables automatic reloading, in
+	// which case certificates are only reloaded on SIGHUP.
+	TLSReloadInterval    time.Duration `hcl:"-"`
+	TLSReloadIntervalRaw interface{}   `hcl:"tls_reload_interval"`
+
 	HTTPReadTimeout          time.Duration `hcl:"-"`
 	HTTPReadTimeoutRaw       interface{}   `hcl:"http_read_timeout"`
 	HTTPReadHeaderTimeout    time.Duration `hcl:"-"`
@@ -134,6 +156,9 @@ type Listener struct {
 	// ChrootNamespace will prepend the specified namespace to requests
 	ChrootNamespaceRaw interface{} `hcl:"chroot_namespace"`
 	ChrootNamespace    string      `hcl:"-"`
+
+	OperatorNamespacePathRaw interface{} `hcl:"operator_namespace_path"`
+	OperatorNamespacePath    string      `hcl:"-"`
 
 	// Per-listener redaction configuration
 	RedactAddressesRaw   any  `hcl:"redact_addresses"`
@@ -299,6 +324,7 @@ func parseListener(item *ast.ObjectItem) (*Listener, error) {
 		l.parseCORSSettings,
 		l.parseHTTPHeaderSettings,
 		l.parseChrootNamespaceSettings,
+		l.parseOperatorNamespaceSettings,
 		l.parseRedactionSettings,
 		l.parseDisableReplicationStatusEndpointSettings,
 		l.parseDisableRequestLimiter,
@@ -445,6 +471,27 @@ func (l *Listener) parseChrootNamespaceSettings() error {
 	return nil
 }
 
+// parseOperatorNamespaceSettings attempts to parse the raw listener
+// operator_namespace_path setting. This setting works in conjunction with the
+// global operator_namespace_path configuration to implement listener-isolated
+// access control. When an operator_namespace_path is defined globally, only
+// listeners with a matching operator_namespace_path can access that namespace.
+func (l *Listener) parseOperatorNamespaceSettings() error {
+	var (
+		err     error
+		setting string
+	)
+
+	err = parseAndClearString(&l.OperatorNamespacePathRaw, &setting)
+	if err != nil {
+		return fmt.Errorf("invalid value for operator_namespace_path: %w", err)
+	}
+
+	l.OperatorNamespacePath = namespace.Canonicalize(setting)
+
+	return nil
+}
+
 // parseType attempts to sanitize and validate the type set on the listener.
 // If the listener has no type set, the fallback value will be used.
 // The state of the listener will be modified.
@@ -542,6 +589,22 @@ func (l *Listener) parseTLSSettings() error {
 
 	if err := parseAndClearBool(&l.TLSDisableClientCertsRaw, &l.TLSDisableClientCerts); err != nil {
 		return fmt.Errorf("invalid value for tls_disable_client_certs: %w", err)
+	}
+
+	if err := parseAndClearDurationSecond(&l.TLSReloadIntervalRaw, &l.TLSReloadInterval); err != nil {
+		return fmt.Errorf("invalid value for tls_reload_interval: %w", err)
+	}
+
+	if l.TLSReloadInterval < 0 {
+		return fmt.Errorf("invalid value for tls_reload_interval: must not be negative")
+	}
+
+	if l.TLSReloadInterval > 0 && l.TLSReloadInterval < minTLSReloadInterval {
+		return fmt.Errorf("invalid value for tls_reload_interval: must be at least %s", minTLSReloadInterval)
+	}
+
+	if l.TLSReloadInterval > maxTLSReloadInterval {
+		return fmt.Errorf("invalid value for tls_reload_interval: must be at most %s", maxTLSReloadInterval)
 	}
 
 	// Clear raw values after successful parsing.

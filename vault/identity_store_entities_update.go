@@ -9,6 +9,7 @@ import (
 
 	"github.com/hashicorp/vault/helper/identity"
 	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/policyutil"
 	"github.com/hashicorp/vault/sdk/helper/strutil"
 	"github.com/hashicorp/vault/sdk/logical"
 )
@@ -64,32 +65,6 @@ func (b *EntityBuilder) WithID(id string) *EntityBuilder {
 	return b
 }
 
-// WithExternalID handles logic related to the external_id.
-func (b *EntityBuilder) WithExternalID(ctx context.Context, externalID string) *EntityBuilder {
-	if b.err != nil || externalID == "" {
-		return b
-	}
-
-	entityByExternalID, err := b.store.MemDBEntityByExternalID(ctx, externalID, true)
-	if err != nil {
-		b.err = err
-		return b
-	}
-
-	if entityByExternalID != nil {
-		// An entity with this external ID already exists, so we'll update it.
-		b.entity = entityByExternalID
-		b.originalSCIMID = b.entity.ScimClientID
-		b.isNew = false
-	} else {
-		// No entity found, so we're just setting the external ID on the current one.
-		b.entity.ExternalID = externalID
-		b.modifiedFields = append(b.modifiedFields, "external_id")
-	}
-
-	return b
-}
-
 // WithName handles the complex logic for finding an entity by name and checking for conflicts.
 func (b *EntityBuilder) WithName(ctx context.Context, name string) *EntityBuilder {
 	if b.err != nil || name == "" {
@@ -130,15 +105,24 @@ func (b *EntityBuilder) WithPolicies(policies []string) *EntityBuilder {
 	if b.err != nil {
 		return b
 	}
-	if strutil.StrListContainsCaseInsensitive(policies, "root") {
+	validatedPolicies := make([]string, 0, len(policies))
+	for _, policy := range policies {
+		canonicalPolicy, err := policyutil.ValidatePolicyName(policy)
+		if err != nil {
+			b.err = fmt.Errorf("invalid policy name %q: %w", policy, err)
+			return b
+		}
+		validatedPolicies = append(validatedPolicies, canonicalPolicy)
+	}
+	if strutil.StrListContainsCaseInsensitive(validatedPolicies, "root") {
 		b.err = fmt.Errorf("policies cannot contain root")
 		return b
 	}
-	dedupedPolicies := strutil.RemoveDuplicates(policies, false)
+	dedupedPolicies := strutil.RemoveDuplicates(validatedPolicies, false)
 	if !strutil.EquivalentSlices(b.entity.Policies, dedupedPolicies) {
 		b.modifiedFields = append(b.modifiedFields, "policies")
 	}
-	b.entity.Policies = strutil.RemoveDuplicates(policies, false)
+	b.entity.Policies = dedupedPolicies
 	return b
 }
 
@@ -228,9 +212,6 @@ func (b *EntityBuilder) FromFieldData(ctx context.Context, d *framework.FieldDat
 	if id, ok := d.GetOk("id"); ok {
 		b.WithID(id.(string))
 	}
-	if externalID, ok := d.GetOk("external_id"); ok {
-		b.WithExternalID(ctx, externalID.(string))
-	}
 	if name, ok := d.GetOk("name"); ok {
 		b.WithName(ctx, name.(string))
 	}
@@ -269,7 +250,51 @@ func (b *EntityBuilder) Upsert(ctx context.Context) (*identity.Entity, error) {
 	return b.entity, nil
 }
 
+// validateEntityNamePathSelectors ensures the id selector cannot retarget an
+// entity/name update away from the entity referenced by the path name.
+func (i *IdentityStore) validateEntityNamePathSelectors(ctx context.Context, d *framework.FieldData) *logical.Response {
+	rawName, ok := d.GetOk("name")
+	if !ok || rawName.(string) == "" {
+		return nil
+	}
+	rawID, hasID := d.GetOk("id")
+	if !hasID || rawID.(string) == "" {
+		return nil
+	}
+
+	entityByName, err := i.MemDBEntityByName(ctx, rawName.(string), true)
+	if err != nil {
+		return logical.ErrorResponse(err.Error())
+	}
+	if entityByName == nil || entityByName.ID != rawID.(string) {
+		return logical.ErrorResponse("invalid id for entity name path")
+	}
+	return nil
+}
+
+// EntityUpdateCommon creates or updates an entity from request field data. Returns (nil, nil) when
+// no changes are needed, which is the correct idempotent behavior for this operation.
 func (i *IdentityStore) EntityUpdateCommon(ctx context.Context, d *framework.FieldData) (*logical.Response, error) {
+	return NewEntityBuilder(i).
+		FromFieldData(ctx, d).
+		Build(ctx)
+}
+
+// EntityIDUpdateCommon creates or updates an entity from the entity/id path
+// after validating that selector fields cannot retarget the addressed entity.
+func (i *IdentityStore) EntityIDUpdateCommon(ctx context.Context, d *framework.FieldData) (*logical.Response, error) {
+	return NewEntityBuilder(i).
+		FromFieldData(ctx, d).
+		Build(ctx)
+}
+
+// EntityNameUpdateCommon creates or updates an entity from the entity/name path
+// after validating that selector fields cannot retarget the addressed entity.
+func (i *IdentityStore) EntityNameUpdateCommon(ctx context.Context, d *framework.FieldData) (*logical.Response, error) {
+	if resp := i.validateEntityNamePathSelectors(ctx, d); resp != nil {
+		return resp, nil
+	}
+
 	return NewEntityBuilder(i).
 		FromFieldData(ctx, d).
 		Build(ctx)

@@ -15,14 +15,20 @@ import {
   SystemApiPoliciesListAclPoliciesListEnum,
   SystemApiSystemListPoliciesRgpListEnum,
 } from '@hashicorp/vault-client-typescript';
+import {
+  performSaveOperation,
+  extractSavedId,
+  findDuplicateNameError,
+  findDuplicateAliasError,
+} from 'vault/utils/identity-helpers';
 
 export default class IdentityEditFormComponent extends Component {
   @service flashMessages;
-  @service store;
   @service api;
 
   @tracked policies = [];
   @tracked policyForm;
+  @tracked errorBanner;
 
   constructor() {
     super(...arguments);
@@ -44,69 +50,122 @@ export default class IdentityEditFormComponent extends Component {
 
   get cancelLink() {
     const { model, mode } = this.args;
-    const routes = {
-      'create-entity': 'vault.cluster.access.identity',
-      'edit-entity': 'vault.cluster.access.identity.show',
-      'merge-entity-merge': 'vault.cluster.access.identity',
-      'create-entity-alias': 'vault.cluster.access.identity.aliases',
-      'edit-entity-alias': 'vault.cluster.access.identity.aliases.show',
-      'create-group': 'vault.cluster.access.identity',
-      'edit-group': 'vault.cluster.access.identity.show',
-      'create-group-alias': 'vault.cluster.access.identity.aliases',
-      'edit-group-alias': 'vault.cluster.access.identity.aliases.show',
-    };
-    const key = model ? `${mode}-${model.identityType}` : 'merge-entity-alias';
-    return routes[key];
+    const identityType = model?.identityType;
+    const isAlias = model?.form?.identityFormType === 'alias';
+    const pluralType = identityType === 'group' ? 'groups' : 'entities';
+
+    if (mode === 'merge') {
+      return 'vault.cluster.access.identity.entities.index';
+    }
+
+    if (mode === 'create') {
+      return `vault.cluster.access.identity.${pluralType}.index`;
+    }
+
+    if (mode === 'edit') {
+      return isAlias
+        ? `vault.cluster.access.identity.${pluralType}.aliases.show`
+        : `vault.cluster.access.identity.${pluralType}.show`;
+    }
+
+    // Fallback route in unexpected modes.
+    return identityType
+      ? `vault.cluster.access.identity.${pluralType}.show`
+      : `vault.cluster.access.identity.${pluralType}.index`;
+  }
+
+  get cancelModelId() {
+    const { model } = this.args;
+    const isAlias = model?.form?.identityFormType === 'alias';
+    if (isAlias) {
+      return model?.id || model?.canonicalId;
+    }
+    return model?.itemId || model?.id;
+  }
+
+  get deleteNoun() {
+    const isAlias = this.args.model?.form?.identityFormType === 'alias';
+    return isAlias ? 'alias' : this.args.model?.identityType;
   }
 
   getMessage(model, isDelete = false) {
-    const mode = this.mode;
-    const typeDisplay = humanize([model.identityType]);
-    const action = isDelete ? 'deleted' : 'saved';
+    const mode = this.args.mode;
+    const isAlias = model.form.identityFormType === 'alias';
+    const typeDisplay = isAlias ? humanize(['alias']) : humanize([model.identityType]);
+    const name = model.form?.data?.name;
+
+    if (isDelete) {
+      return name ? `Successfully deleted ${typeDisplay}: ${name}.` : `Successfully deleted ${typeDisplay}.`;
+    }
     if (mode === 'merge') {
       return 'Successfully merged entities';
     }
-    if (model.id) {
-      return `Successfully ${action} ${typeDisplay} ${model.id}.`;
+    if (name) {
+      return `Successfully saved ${typeDisplay}: ${name}.`;
     }
-    return `Successfully ${action} ${typeDisplay}.`;
+    return `Successfully saved ${typeDisplay}.`;
   }
 
   save = task(
     waitFor(async () => {
-      const { model } = this.args;
-      const message = this.getMessage(model);
+      const { model, mode, onSave } = this.args;
+      const { data } = model.form.toJSON();
 
-      try {
-        await model.save();
-      } catch (err) {
-        // err will display via model state
+      const duplicateNameError =
+        findDuplicateNameError({ model, mode, data }) || findDuplicateAliasError({ model, mode, data });
+      if (duplicateNameError) {
+        this.errorBanner = duplicateNameError;
         return;
       }
-      this.flashMessages.success(message);
-      await this.args.onSave({ saveType: 'save', model });
+
+      try {
+        const response = await performSaveOperation({
+          api: this.api,
+          model,
+          mode,
+          data,
+        });
+
+        await onSave({
+          saveType: 'save',
+          model,
+          id: extractSavedId({ mode, data, response, model }),
+        });
+
+        this.flashMessages.success(this.getMessage(model));
+      } catch (err) {
+        const { message } = await this.api.parseError(err);
+        this.errorBanner = message;
+      }
     })
   );
 
-  willDestroy() {
-    // components are torn down after store is disconnected and will cause an error if attempt to unload record
-    const noTeardown = this.store && !this.store.isDestroying;
-    const model = this.model;
-    if (noTeardown && model && model.isDirty && !model.isDestroyed && !model.isDestroying) {
-      model.rollbackAttributes();
+  @action
+  async deleteItem(model) {
+    const message = this.getMessage(model, true);
+    const formType = model.form.identityFormType;
+    const identityType = model.identityType;
+    const id = this.cancelModelId;
+
+    try {
+      if (formType === 'alias') {
+        const methodType = identityType === 'group' ? 'groupDeleteAliasById' : 'entityDeleteAliasById';
+        await this.api.identity[methodType](id);
+      } else {
+        const methodType = identityType === 'group' ? 'groupDeleteById' : 'entityDeleteById';
+        await this.api.identity[methodType](id);
+      }
+
+      this.flashMessages.success(message);
+
+      return this.args.onSave({ saveType: 'delete', model });
+    } catch (err) {
+      const { message: errorMessage } = await this.api.parseError(err);
+      this.errorBanner = errorMessage;
+      return undefined;
     }
-    super.willDestroy(...arguments);
   }
 
-  @action
-  deleteItem(model) {
-    const message = this.getMessage(model, true);
-    const flash = this.flashMessages;
-    model.destroyRecord().then(() => {
-      flash.success(message);
-      return this.args.onSave({ saveType: 'delete', model });
-    });
-  }
   @action
   onCreatePolicy(name) {
     this.policyForm = new PolicyForm({ name, enforcement_level: 'hard-mandatory' }, { isNew: true });

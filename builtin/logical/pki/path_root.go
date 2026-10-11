@@ -315,7 +315,7 @@ func (b *backend) pathCAGenerateRoot(ctx context.Context, req *logical.Request, 
 	}
 
 	// Store it as the CA bundle
-	myIssuer, myKey, err := sc.writeCaBundle(cb, issuerName, keyName)
+	myIssuer, myKey, err := sc.writeCaBundle(cb, issuerName, keyName, genParams.role.ParameterSet)
 	if err != nil {
 		return nil, err
 	}
@@ -323,6 +323,9 @@ func (b *backend) pathCAGenerateRoot(ctx context.Context, req *logical.Request, 
 	resp.Data["issuer_name"] = myIssuer.Name
 	resp.Data["key_id"] = myKey.ID
 	resp.Data["key_name"] = myKey.Name
+	if genParams.exported && myKey.ParameterSet != "" {
+		resp.Data["private_key_parameter_set"] = myKey.ParameterSet
+	}
 
 	// The one time that it is safe (and good) to copy the
 	// SignatureAlgorithm field off the certificate (for the purposes of
@@ -350,7 +353,8 @@ func (b *backend) pathCAGenerateRoot(ctx context.Context, req *logical.Request, 
 	if err != nil {
 		return nil, err
 	}
-	b.pkiCertificateCounter.Increment().AddIssuedCertificate(true, parsedBundle.Certificate)
+	mountInfo := issuing.MountAttributionFromRequest(ctx, req, b.backendUUID, b.ConsumptionBillingManager.GetParentNamespaceID)
+	b.pkiCertificateCounter.Increment().WithMountInfo(mountInfo).AddIssuedCertificate(true, parsedBundle.Certificate)
 
 	// Build a fresh CRL
 	warnings, err = b.CrlBuilder().Rebuild(sc, true)
@@ -535,7 +539,8 @@ func (b *backend) pathIssuerSignIntermediate(ctx context.Context, req *logical.R
 	if err != nil {
 		return nil, err
 	}
-	b.pkiCertificateCounter.Increment().AddIssuedCertificate(true, parsedBundle.Certificate)
+	mountInfo := issuing.MountAttributionFromRequest(ctx, req, b.backendUUID, b.ConsumptionBillingManager.GetParentNamespaceID)
+	b.pkiCertificateCounter.Increment().WithMountInfo(mountInfo).AddIssuedCertificate(true, parsedBundle.Certificate)
 
 	if warnAboutTruncate &&
 		signingBundle.Certificate.NotAfter.Equal(parsedBundle.Certificate.NotAfter) {

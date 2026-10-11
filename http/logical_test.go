@@ -25,9 +25,9 @@ import (
 	"github.com/hashicorp/vault/api"
 	"github.com/hashicorp/vault/audit"
 	credUserpass "github.com/hashicorp/vault/builtin/credential/userpass"
-	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/helper/testhelpers/corehelpers"
 	"github.com/hashicorp/vault/internalshared/configutil"
+	"github.com/hashicorp/vault/internalshared/namespace"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/consts"
 	"github.com/hashicorp/vault/sdk/helper/logging"
@@ -1196,6 +1196,54 @@ func TestLogical_SnapshotParams(t *testing.T) {
 			require.Equal(t, tc.wantOperation, lreq.Operation)
 			require.Equal(t, tc.wantData, lreq.Data)
 			require.Equal(t, tc.wantRequiresSnapshotID, lreq.RequiresSnapshotID)
+		})
+	}
+}
+
+// TestLogical_SCIMPathSetsHTTPRequest verifies that buildLogicalRequest sets
+// req.HTTPRequest for identity/scim/ paths even when passHTTPReq is false,
+// so that SCIM handlers can derive the request base URL.
+func TestLogical_SCIMPathSetsHTTPRequest(t *testing.T) {
+	core, _, rootToken := vault.TestCoreUnsealed(t)
+
+	testCases := []struct {
+		name            string
+		url             string
+		wantHTTPRequest bool
+	}{
+		{
+			name:            "scim client path sets HTTPRequest",
+			url:             "http://127.0.0.1:8200/v1/identity/scim/client/my-client",
+			wantHTTPRequest: true,
+		},
+		{
+			name:            "scim v2 Users path sets HTTPRequest",
+			url:             "http://127.0.0.1:8200/v1/identity/scim/v2/Users",
+			wantHTTPRequest: true,
+		},
+		{
+			name:            "non-scim path does not set HTTPRequest",
+			url:             "/v1/sys/health",
+			wantHTTPRequest: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.url, nil)
+			req = req.WithContext(namespace.RootContext(nil))
+			req.Header.Add(consts.AuthHeaderName, rootToken)
+
+			lreq, _, status, err := buildLogicalRequest(core, nil, req, "")
+			require.NoError(t, err)
+			require.Equal(t, 0, status)
+
+			if tc.wantHTTPRequest {
+				require.NotNil(t, lreq.HTTPRequest, "expected HTTPRequest to be set for path %s", tc.url)
+				require.Equal(t, req, lreq.HTTPRequest)
+			} else {
+				require.Nil(t, lreq.HTTPRequest, "expected HTTPRequest to be nil for path %s", tc.url)
+			}
 		})
 	}
 }

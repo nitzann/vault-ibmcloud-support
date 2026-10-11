@@ -9,17 +9,35 @@ import (
 	"context"
 
 	"github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/internalshared/namespace"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
-func getEnterpriseTokenId(_ string) string {
-	return ""
+func (ts *TokenStore) entPaths() []*framework.Path {
+	return nil
 }
 
-func normalizeEnterpriseTokenToID(token string) string {
+func getOAuthJwtId(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+
+func normalizeOAuthJwtToId(token string) string {
 	return token
 }
 
 func (ts *TokenStore) handleTidyEnterpriseTokens(_ context.Context, _ *namespace.Namespace, _ *multierror.Error) error {
 	return nil
+}
+
+func (ts *TokenStore) revokeCommonJWT(ctx context.Context, req *logical.Request, id string) (*logical.Response, error) {
+	return logical.ErrorResponse("cannot revoke JWTs"), nil
+}
+
+func (ts *TokenStore) revokeJWT(ctx context.Context, req *logical.Request, jwtToken string) (*logical.Response, error) {
+	return logical.ErrorResponse("cannot revoke JWTs"), nil
+}
+
+func (c *Core) normalizeJwtForLookup(ctx context.Context, token string) (string, error) {
+	return token, nil
 }

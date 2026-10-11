@@ -17,8 +17,8 @@ import (
 	"github.com/hashicorp/go-secure-stdlib/parseutil"
 	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/vault/audit"
-	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/internalshared/configutil"
+	"github.com/hashicorp/vault/internalshared/namespace"
 	"github.com/hashicorp/vault/sdk/helper/consts"
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
 	"github.com/hashicorp/vault/sdk/helper/salt"
@@ -146,7 +146,7 @@ func (c *Core) enableAudit(ctx context.Context, entry *MountEntry, updateStorage
 				return fmt.Errorf("error getting absolute path of plugin dir for audit validation: %w", err)
 			}
 			// Walk the audit path up checking that none of them are the plugin dir
-			for len(auditDir) > 1 || auditDir[0] != filepath.Separator {
+			for {
 				rp, err := filepath.Rel(pluginDir, auditDir)
 				if err != nil {
 					return fmt.Errorf("error checking relative path for audit validation: %w", err)
@@ -154,7 +154,11 @@ func (c *Core) enableAudit(ctx context.Context, entry *MountEntry, updateStorage
 				if rp == "." {
 					return errors.New("audit file target may not be in the plugin directory")
 				}
-				auditDir = filepath.Dir(auditDir)
+				parent := filepath.Dir(auditDir)
+				if parent == auditDir { // reached filesystem root (works on all OSes)
+					break
+				}
+				auditDir = parent
 			}
 		}
 	}

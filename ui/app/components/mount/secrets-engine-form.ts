@@ -5,11 +5,11 @@
 
 import { action } from '@ember/object';
 import { inject as service } from '@ember/service';
-import { capitalize } from '@ember/string';
 import Component from '@glimmer/component';
 import { tracked } from '@glimmer/tracking';
 import { task } from 'ember-concurrency';
 import OidcKeyForm from 'vault/forms/oidc/key';
+import { isTransientKvMountError } from 'vault/utils/kv-mount-transient-error';
 
 import type Router from '@ember/routing/router';
 import type FlashMessagesService from 'ember-cli-flash/services/flash-messages';
@@ -29,7 +29,9 @@ import {
 } from 'vault/utils/external-plugin-helpers';
 import type { EngineVersionInfo } from 'vault/utils/plugin-catalog-helpers';
 import { sortVersions } from 'vault/utils/version-utils';
+import { SECRET_ENGINE_CREATED } from 'vault/utils/analytic-events';
 import type { ValidationMap } from 'vault/vault/app-types';
+import type AnalyticsService from 'vault/services/analytics';
 
 // Extended config interface for plugin mounting
 interface ExtendedMountConfig {
@@ -69,6 +71,7 @@ const SUPPORTED_BACKENDS = supportedSecretBackends();
  * ```
  */
 export default class MountSecretsEngineFormComponent extends Component<Args> {
+  @service declare analytics: AnalyticsService;
   @service declare flashMessages: FlashMessagesService;
   @service declare api: ApiService;
   @service declare capabilities: CapabilitiesService;
@@ -98,6 +101,10 @@ export default class MountSecretsEngineFormComponent extends Component<Args> {
     this.configObject.plugin_version = '';
   }
 
+  get normalizedType(): string {
+    return this.args.model.form.normalizedType ?? '';
+  }
+
   // Helper to get config object with proper typing
   get configObject() {
     return this.args.model.form.data.config as ExtendedMountConfig;
@@ -117,14 +124,31 @@ export default class MountSecretsEngineFormComponent extends Component<Args> {
     const breadcrumbs: { label: string; route?: string; icon?: string }[] = [
       { label: 'Vault', route: 'vault.cluster', icon: 'vault' },
       { label: 'Secrets engines', route: 'vault.cluster.secrets.backends' },
-      { label: 'Enable secrets engine', route: 'vault.cluster.secrets.enable' },
+      { label: 'Create a new secrets engine', route: 'vault.cluster.secrets.enable' },
     ];
 
     if (this.args?.model?.form?.normalizedType) {
-      breadcrumbs.push({ label: capitalize(this.args?.model?.form?.normalizedType) });
+      breadcrumbs.push({ label: this.pageTitle });
     }
 
     return breadcrumbs;
+  }
+
+  get pageTitle() {
+    const normalizedType = this.args?.model?.form?.normalizedType;
+    const displayName = normalizedType ? engineDisplayData(normalizedType).displayName : '';
+    return `Create a ${displayName} secrets engine`;
+  }
+
+  get engineDocPath(): string | null {
+    const normalizedType = this.args.model.form.normalizedType;
+    if (!normalizedType) return null;
+    const DOC_PATH_OVERRIDES: Record<string, string> = {
+      database: '/vault/docs/secrets/databases',
+      keymgmt: '/vault/docs/secrets/key-management',
+      'pki-external-ca': '/vault/docs/secrets/pki',
+    };
+    return DOC_PATH_OVERRIDES[normalizedType] ?? `/vault/docs/secrets/${normalizedType}`;
   }
 
   get pluginTypeOptions() {
@@ -228,6 +252,16 @@ export default class MountSecretsEngineFormComponent extends Component<Args> {
     // Filter external versions and exclude empty strings
     const externalVersions = versions.filter((version) => !version.isBuiltin && version.version !== '');
     return externalVersions.map((version) => version.version);
+  }
+
+  // `object` carries the engine type, suffixed with the version when one applies (e.g. "kv-v2")
+  private trackSecretsCreationEvent(type: string, successFlag: boolean, version?: number) {
+    this.analytics.trackEvent(SECRET_ENGINE_CREATED, {
+      objectType: 'secrets-engine',
+      object: version ? `${type}-v${version}` : type,
+      process: 'UI',
+      successFlag,
+    });
   }
 
   // Check if the currently selected version differs from the pinned version
@@ -361,6 +395,9 @@ export default class MountSecretsEngineFormComponent extends Component<Args> {
     this.formValidations = null;
     this.invalidFormAlert = null;
 
+    // Derived before the request so analytics can report it on failure too
+    const version = options ? options.version : data.options?.version;
+
     try {
       // Mount the secrets engine
       yield this.api.sys.mountsEnableSecretsEngine(path, data);
@@ -378,13 +415,16 @@ export default class MountSecretsEngineFormComponent extends Component<Args> {
       }
 
       // Determine if we should use engine routes
-      const version = options ? options.version : data.options?.version;
       const useEngineRoute = isAddonEngine(mountModel.normalizedType, Number(version));
 
-      this.onMountSuccess(type, path, useEngineRoute);
+      this.trackSecretsCreationEvent(type, true, version);
+      // Mount creation already succeeded here; any error below is about loading the destination route,
+      // not the create request, so it must not be treated as a mount-creation failure.
+      yield this.attemptPostMountNavigation(type, path, useEngineRoute);
     } catch (error) {
+      this.trackSecretsCreationEvent(type, false, version);
       const { status, response, message } = yield this.api.parseError(error);
-      this.onMountError(status, response.errors, message);
+      this.onMountError(status, response?.errors, message);
     }
   }
 
@@ -493,6 +533,30 @@ export default class MountSecretsEngineFormComponent extends Component<Args> {
       transition = this.router.transitionTo('vault.cluster.secrets.backends');
     }
     return transition?.followRedirects();
+  }
+
+  // The destination route's model hook already retries internally on the known transient "mount not
+  // ready yet" responses, so a single attempt here waits for that to resolve or exhaust its retries.
+  // Do not retry by calling transitionTo again: each failed transition renders its error substate
+  // immediately, so retrying here would just flash the raw backend error once per attempt.
+  async attemptPostMountNavigation(type: string, path: string, useEngineRoute: boolean): Promise<void> {
+    try {
+      await this.onMountSuccess(type, path, useEngineRoute);
+    } catch (error) {
+      const { status, message } = await this.api.parseError(error);
+
+      if (isTransientKvMountError(status, message)) {
+        this.flashMessages.warning(
+          'Secrets engine was created, but it is still becoming available on this node. Refresh shortly or connect to an active node.'
+        );
+      } else {
+        // The mount was still created successfully, so avoid onMountError (which assumes the create
+        // request itself failed) and surface a narrower warning instead.
+        this.flashMessages.warning(
+          `The secrets engine at ${path} was created, but loading it failed. ${message}`
+        );
+      }
+    }
   }
 
   @action

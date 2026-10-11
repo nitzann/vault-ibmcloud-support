@@ -140,6 +140,59 @@ Running tests will spin up a Vault dev server on port :9200 via a pretest script
 - `pnpm run test:filter -f="policies"` run the filtered test in the browser with no splitting. `-f` is set to `!enterprise` by default
   [QUnit's `filter` config](https://api.qunitjs.com/config/QUnit.config#qunitconfigfilter-string--default-undefined)
 
+#### Playwright personas
+
+Playwright runs against real Vault servers with the UI embedded in the binary. Build
+the binary with the intended UI first (`make static-dist && make entdev-ui` from the
+repository root), and make it available as `vault` on `PATH`. Playwright starts,
+initializes, and unseals its own servers; do not start servers on its test ports.
+
+From `ui/`, run a focused spec with its persona:
+
+```sh
+pnpm exec playwright test e2e/tests/raft/storage.spec.ts --project=chrome:raft
+```
+
+[test-users.ts](e2e/test-users.ts) defines personas independently of
+[policy definitions](e2e/policies/index.ts):
+
+- `name` identifies the setup/browser projects, test directory, and session/key files.
+- `storage` selects an implemented backend (`inmem` or `raft`).
+- `policy` selects a key from `USER_POLICY_MAP`, not a second persona name.
+
+The existing `superuser` and `raft` personas share the `superuser` policy, but run
+on separate in-memory and Raft servers. Their project names remain
+`chrome:superuser` and `chrome:raft`. The `readonly` persona (`chrome:readonly`)
+uses the [readonly policy](e2e/policies/readonly.hcl) to verify that list and
+detail views hide actions the token cannot perform. Its specs seed data with the
+persona's root token through [rootApi](e2e/fixtures/root-api.ts). Add a persona entry and a matching
+`e2e/tests/<name>/` directory to add a scenario; add a policy only when permissions
+actually differ. Setup verifies the backend and issued token's policy, then saves
+an isolated session for the browser project.
+
+Only implemented environment dimensions belong in the persona type. Consul,
+license variants, edition, and version selection need runner support and tests
+before being added; an unused field would not prove that environment was tested.
+The Raft persona includes a single-node overview test and an isolated membership
+flow in [membership.spec.ts](e2e/tests/raft/membership.spec.ts). The latter starts
+two disposable Raft nodes on dynamically allocated loopback ports. It joins an
+uninitialized peer through the UI, unseals it, verifies both backend membership and
+the reloaded overview, then removes that peer through the UI and verifies its
+persisted absence. It uses a non-root persona token for membership read-back and
+removal. Nodes and temporary data are cleaned up even when the test fails, and
+retries get a fresh cluster. Credential-entry traces, videos, and screenshots are
+disabled for this test.
+Non-secret membership responses and rendered rows are attached to the test report
+before joining, after joining/reload, and after removal/reload.
+
+```sh
+pnpm exec playwright test e2e/tests/raft --project=chrome:raft
+```
+
+For migration verification, run the same membership spec against binaries built
+with the pre- and post-migration UI and retain both results. Passing against only
+one binary does not establish before/after equivalence.
+
 ### Linting
 
 - `pnpm lint:js`
@@ -159,18 +212,6 @@ Hello and thank you for contributing to the Vault UI! Below is a list of pattern
 - [forms](docs/forms.md)
 - [css](docs/css.md)
 - [ember engines](docs/engines.md)
-
-### Updating @hashicorp-internal/vault-reporting
-
-Code regarding vault-reporting module lives in the [shared-secure-ui](https://github.com/hashicorp/shared-secure-ui) repo, and it is being used as a tarball in this repo.
-
-We use the script [update-vault-reporting-addon.sh](scripts/update-vault-reporting-addon.sh) to fetch the latest tarball from artifactory and update `package.json` accordingly. To run the script, you'll need to have [Doormat CLI](https://docs.prod.secops.hashicorp.services/doormat/cli/) and [jq](https://formulae.brew.sh/formula/jq) installed locally.
-
-Example:
-
-```
-./scripts/update-vault-reporting-addon.sh
-```
 
 ## Further Reading / Useful Links
 

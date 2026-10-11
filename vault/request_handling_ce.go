@@ -15,46 +15,53 @@ import (
 
 type OAuthResourceServerConfigProfile struct{}
 
-func (c *Core) validateEnterpriseTokenAndFetchEntity(ctx context.Context, tokenString string) (bool, map[string]interface{}, *identity.Entity, *identity.Entity, *OAuthResourceServerConfigProfile, error) {
+func (c *Core) validateOAuthJwtAndFetchEntity(ctx context.Context, tokenString string) (bool, map[string]interface{}, *identity.Entity, *identity.Entity, *OAuthResourceServerConfigProfile, error) {
 	return false, nil, nil, nil, nil, errors.New("not implemented")
 }
 
-func (c *Core) createAndStoreEnterpriseTokenEntry(ctx context.Context, req *logical.Request, allClaims map[string]interface{}, entity *identity.Entity, actorEntity *identity.Entity, chosenProfile *OAuthResourceServerConfigProfile) error {
+func (c *Core) createAndStoreOAuthJwtTokenEntry(ctx context.Context, req *logical.Request, allClaims map[string]interface{}, entity *identity.Entity, actorEntity *identity.Entity, chosenProfile *OAuthResourceServerConfigProfile) error {
 	return nil
 }
 
-func isActivationFlagEnabledForEnterpriseToken(c *Core) bool {
-	return false
-}
-
-func getEnterpriseTokenMetadata(_ map[string]interface{}) string {
+func getJwtIssuer(_ map[string]interface{}) string {
 	return ""
 }
 
-func getEnterpriseTokenIssuer(_ map[string]interface{}) string {
+func getJwtUniqueIDFromProfile(_ map[string]interface{}, _ *OAuthResourceServerConfigProfile) (string, error) {
+	return "", errors.New("not implemented")
+}
+
+func getJwtTransaction(_ map[string]interface{}) string {
 	return ""
 }
 
-func getEnterpriseTokenTransaction(_ map[string]interface{}) string {
-	return ""
-}
-
-func getEnterpriseTokenAudience(_ map[string]interface{}) []string {
+func getJwtAudience(_ map[string]interface{}) []string {
 	return nil
 }
 
-func getEnterpriseTokenAuthorizationDetails(_ map[string]interface{}) []logical.AuthorizationDetail {
+func getAuthorizationDetailsClaim(_ *OAuthResourceServerConfigProfile) string {
+	return "authorization_details"
+}
+
+func getJwtAuthorizationDetails(_ map[string]interface{}, _ *OAuthResourceServerConfigProfile) []logical.AuthorizationDetail {
 	return nil
 }
 
-func (c *Core) materializeEnterpriseTokenForUsage(_ context.Context, req *logical.Request, _ *logical.Auth, _ bool) (*logical.Request, error) {
+func (c *Core) materializeOAuthJwtForUsage(_ context.Context, req *logical.Request, _ *logical.Auth, _ bool) (*logical.Request, error) {
 	return req, nil
 }
 
-func (c *Core) performSecondaryEntityTokenChecks(_ context.Context, _ *ACL, _ *identity.Entity, _ map[string][]string) (*ACL, error) {
+func (c *Core) performDelegationTokenChecks(_ context.Context, _ *ACL, _ *identity.Entity, _ map[string][]string) (*ACL, error) {
 	return nil, errors.New("not implemented")
 }
 
 func (c *Core) fetchCeilingPolicies(ctx context.Context, entity *identity.Entity) (map[string][]string, error) {
 	return nil, errors.New("not implemented")
+}
+
+func (c *Core) filterOAuthJWTCapabilities(_ context.Context, _ *logical.Request, capabilities, eventTypes []string) ([]string, []string) {
+	return capabilities, eventTypes
+}
+
+func extractValidatedProfileDetailsIntoRequest(chosenProfile *OAuthResourceServerConfigProfile, req *logical.Request) {
 }

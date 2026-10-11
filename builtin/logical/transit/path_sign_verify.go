@@ -32,6 +32,7 @@ type policyVerifyArgs struct {
 	input      []byte
 	options    keysutil.SigningOptions
 	sig        string
+	keyVersion int
 }
 
 type commonSignVerifyApiArgs struct {
@@ -400,7 +401,7 @@ func (b *backend) pathSignWrite(ctx context.Context, req *logical.Request, d *fr
 	}
 	defer p.Unlock()
 
-	if err := validateCommonSignVerifyApiArgs(p, apiArgs.commonSignVerifyApiArgs); err != nil {
+	if err := validateCommonSignVerifyApiArgs(p, apiArgs.commonSignVerifyApiArgs, apiArgs.keyVersion); err != nil {
 		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
 	}
 
@@ -489,7 +490,7 @@ func (b *backend) pathSignWrite(ctx context.Context, req *logical.Request, d *fr
 		}
 	}
 
-	if err = b.incrementBillingCounts(ctx, uint64(successfulRequests)); err != nil {
+	if err = b.incrementBillingCounts(ctx, req, uint64(successfulRequests)); err != nil {
 		b.Logger().Error("failed to track transit sign request count", "error", err.Error())
 	}
 
@@ -507,11 +508,12 @@ func (b *backend) getPolicySignArgs(ctx context.Context, p *keysutil.Policy, arg
 		return policySignArgs{}, fmt.Errorf("unable to decode input: %s", err)
 	}
 
-	if p.Type.HashSignatureInput() && !args.prehashed {
-		hf := keysutil.HashFuncMap[args.hashAlgorithm]()
+	if p.KeyVersionType(args.keyVersion).HashSignatureInput() && !args.prehashed {
+		hf := keysutil.HashFuncMap[args.hashAlgorithm]
 		if hf != nil {
-			hf.Write(input)
-			input = hf.Sum(nil)
+			h := hf()
+			h.Write(input)
+			input = h.Sum(nil)
 		}
 	}
 
@@ -538,13 +540,13 @@ func (b *backend) getPolicySignArgs(ctx context.Context, p *keysutil.Policy, arg
 	return psa, nil
 }
 
-func validateCommonSignVerifyApiArgs(p *keysutil.Policy, apiArgs commonSignVerifyApiArgs) error {
+func validateCommonSignVerifyApiArgs(p *keysutil.Policy, apiArgs commonSignVerifyApiArgs, ver int) error {
 	if !p.Type.SigningSupported() {
 		return fmt.Errorf("key type %v does not support signing", p.Type)
 	}
 
 	// Perform Vault version specific checks (CE vs ENT)
-	return validateSignApiArgsVersionSpecific(p, apiArgs)
+	return validateSignApiArgsVersionSpecific(p, apiArgs, ver)
 }
 
 func getSignApiArgs(d *framework.FieldData) (signApiArgs, error) {
@@ -688,10 +690,6 @@ func (b *backend) pathVerifyWrite(ctx context.Context, req *logical.Request, d *
 	}
 	defer p.Unlock()
 
-	if err := validateCommonSignVerifyApiArgs(p, apiArgs.commonSignVerifyApiArgs); err != nil {
-		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
-	}
-
 	response := make([]batchResponseVerifyItem, len(batchInputItems))
 
 	successfulRequests := 0
@@ -745,7 +743,7 @@ func (b *backend) pathVerifyWrite(ctx context.Context, req *logical.Request, d *
 		}
 	}
 
-	if err = b.incrementBillingCounts(ctx, uint64(successfulRequests)); err != nil {
+	if err = b.incrementBillingCounts(ctx, req, uint64(successfulRequests)); err != nil {
 		b.Logger().Error("failed to track transit sign verify request count", "error", err.Error())
 	}
 
@@ -816,11 +814,21 @@ func (b *backend) getPolicyVerifyArgs(ctx context.Context, p *keysutil.Policy, a
 		return policyVerifyArgs{}, fmt.Errorf("failed to parse signature as a string: %s", err)
 	}
 
-	if p.Type.HashSignatureInput() && !apiArgs.prehashed {
-		hf := keysutil.HashFuncMap[apiArgs.hashAlgorithm]()
+	sigVer, err := getVersion(sig)
+	if err != nil {
+		return policyVerifyArgs{}, fmt.Errorf("failed to parse version from signature: %s", err)
+	}
+
+	if err := validateCommonSignVerifyApiArgs(p, apiArgs.commonSignVerifyApiArgs, sigVer); err != nil {
+		return policyVerifyArgs{}, err
+	}
+
+	if p.KeyVersionType(sigVer).HashSignatureInput() && !apiArgs.prehashed {
+		hf := keysutil.HashFuncMap[apiArgs.hashAlgorithm]
 		if hf != nil {
-			hf.Write(input)
-			input = hf.Sum(nil)
+			h := hf()
+			h.Write(input)
+			input = h.Sum(nil)
 		}
 	}
 
@@ -839,6 +847,7 @@ func (b *backend) getPolicyVerifyArgs(ctx context.Context, p *keysutil.Policy, a
 			SaltLength:    apiArgs.saltLength,
 			SigAlgorithm:  apiArgs.sigAlgorithm,
 		},
+		keyVersion: sigVer,
 	}
 
 	if err := b.populateEntPolicyVerifyOptions(ctx, p, apiArgs, item, &vsa); err != nil {

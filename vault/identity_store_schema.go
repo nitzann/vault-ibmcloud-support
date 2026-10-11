@@ -16,6 +16,7 @@ const (
 	groupAliasesTable          = "group_aliases"
 	oidcClientsTable           = "oidc_clients"
 	scimClientsTable           = "scim_clients"
+	tpmsTable                  = "tpms"
 	factorsIndex               = "factors"
 	issuerAndExternalIdFactors = "issuer_externalid_factors"
 )
@@ -32,6 +33,8 @@ func identityStoreSchema(lowerCaseName bool) *memdb.DBSchema {
 		groupAliasesTableSchema,
 		oidcClientsTableSchema,
 		scimClientSchema,
+		tpmsTableSchema,
+		tpmgroupsTableSchema,
 	}
 
 	for _, schemaFunc := range schemas {
@@ -185,6 +188,7 @@ func entitiesTableSchema(lowerCaseName bool) *memdb.TableSchema {
 					Indexes: []memdb.Indexer{
 						&memdb.StringFieldIndex{Field: "NamespaceID"},
 						&memdb.StringFieldIndex{Field: "ScimClientID"},
+						&memdb.StringFieldIndex{Field: "Name"},
 					},
 				},
 			},
@@ -245,11 +249,20 @@ func groupsTableSchema(lowerCaseName bool) *memdb.TableSchema {
 				},
 			},
 			"scim_client_id": {
+				// AllowMissing is intentionally absent. scimClientIDIndexer always
+				// returns (true, ...) — even for ScimClientID == "" — so CompoundIndex
+				// never sees a missing sub-index and never truncates the key. Unmanaged
+				// groups are stored under (nsID, scimClientIDSentinel, name) and are
+				// reachable via a prefix scan on (nsID, ""), which PrefixFromArgs maps
+				// to the sentinel. See the scimClientIDIndexer doc for the full story.
 				Name: "scim_client_id",
-				Indexer: &memdb.StringFieldIndex{
-					Field: "ScimClientID",
+				Indexer: &memdb.CompoundIndex{
+					Indexes: []memdb.Indexer{
+						&memdb.StringFieldIndex{Field: "NamespaceID"},
+						scimClientIDIndexer{},
+						&memdb.StringFieldIndex{Field: "Name", Lowercase: lowerCaseName},
+					},
 				},
-				AllowMissing: true,
 			},
 		},
 	}

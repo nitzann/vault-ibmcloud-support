@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/hmac"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -150,7 +149,7 @@ func (b *backend) pathHMACWrite(ctx context.Context, req *logical.Request, d *fr
 	if err != nil {
 		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
 	}
-	if key == nil && p.Type != keysutil.KeyType_MANAGED_KEY {
+	if key == nil && p.KeyVersionType(ver) != keysutil.KeyType_MANAGED_KEY {
 		return nil, fmt.Errorf("HMAC key value could not be computed")
 	}
 
@@ -207,9 +206,9 @@ func (b *backend) pathHMACWrite(ctx context.Context, req *logical.Request, d *fr
 		var retBytes []byte
 
 		if p.Type == keysutil.KeyType_MANAGED_KEY {
-			managedKeySystemView, ok := b.System().(logical.ManagedKeySystemView)
-			if !ok {
-				response[i].err = errors.New("unsupported system view")
+			managedKeySystemView, err := b.GetManagedKeySystemView()
+			if err != nil {
+				response[i].err = err
 			}
 
 			retBytes, err = p.HMACWithManagedKey(ctx, ver, managedKeySystemView, b.backendUUID, algorithm, input)
@@ -251,7 +250,7 @@ func (b *backend) pathHMACWrite(ctx context.Context, req *logical.Request, d *fr
 		}
 	}
 
-	if err = b.incrementBillingCounts(ctx, uint64(successfulRequests)); err != nil {
+	if err = b.incrementBillingCounts(ctx, req, uint64(successfulRequests)); err != nil {
 		b.Logger().Error("failed to track transit hmac request count", "error", err.Error())
 	}
 
@@ -427,7 +426,7 @@ func (b *backend) pathHMACVerify(ctx context.Context, req *logical.Request, d *f
 		}
 	}
 
-	if err = b.incrementBillingCounts(ctx, uint64(successfulRequests)); err != nil {
+	if err = b.incrementBillingCounts(ctx, req, uint64(successfulRequests)); err != nil {
 		b.Logger().Error("failed to track transit hmac verify request count", "error", err.Error())
 	}
 

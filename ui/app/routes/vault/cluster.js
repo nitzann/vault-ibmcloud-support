@@ -12,8 +12,9 @@ import getStorage from '../../lib/token-storage';
 import localStorage from 'vault/lib/local-storage';
 import clearModelCache from 'vault/utils/shared-model-boundary';
 import { assert } from '@ember/debug';
+import config from 'vault/config/environment';
 
-import { v4 as uuidv4 } from 'uuid';
+import { getOrCreateAnalyticsUserId } from 'vault/utils/preferences';
 
 import {
   INIT,
@@ -174,9 +175,30 @@ export default class ClusterRoute extends Route {
     return this.transitionToTargetRoute(transition);
   }
 
+  // Reads the operator's ui_telemetry flag from sys/internal/ui/settings and hands
+  // it to the analytics service's consent gate.
+  async startVaultSmAnalytics() {
+    const { ANALYTICS_CONFIG } = config.APP;
+    let uiTelemetryEnabled = false;
+    try {
+      const settings = await this.api.sys.internalUiReadSettings();
+      uiTelemetryEnabled = Boolean(settings?.ui_telemetry_enabled);
+    } catch (e) {
+      uiTelemetryEnabled = false;
+    }
+    this.analytics.startVaultSmAnalytics(uiTelemetryEnabled, ANALYTICS_CONFIG);
+  }
+
   async addAnalyticsService(model) {
-    // identify user for analytics service
-    if (this.analytics.activated) {
+    // HVD-managed clusters start Segment at the application-route level, with no
+    // consent gate. The consent-gated Segment start is Self-Managed only.
+    if (!this.flagsService.isHvdManaged) await this.startVaultSmAnalytics();
+
+    // Identify the user for analytics. Compute the identity when analytics is
+    // active OR when the consent banner is about to prompt — in the latter case
+    // the analytics service caches it and applies it if the user accepts, so the
+    // session is identified even though consent is granted after this route loads.
+    if (this.analytics.activated || this.analytics.shouldPromptConsent) {
       let licenseId = '';
 
       try {
@@ -188,16 +210,28 @@ export default class ClusterRoute extends Route {
       }
 
       try {
-        const entity_id = this.auth.authData?.entityId;
-        const entity = entity_id ? entity_id : `root_${uuidv4()}`;
+        // Store the raw and un-prefixed ID, the entity ID when authenticated, else a
+        // stable per-browser uuid persisted in localStorage (token-based access
+        // has no entity ID). The `vault-` realm prefix is applied only here at
+        // identify() time and is never persisted or sent as uniqueSecurityName.
+        const entityId = this.auth.authData?.entityId;
+        const uniqueSecurityName = entityId ? entityId : getOrCreateAnalyticsUserId();
 
-        this.analytics.identifyUser(entity, {
+        this.analytics.identifyUser(`vault-${uniqueSecurityName}`, {
+          realmName: 'vault',
+          uniqueSecurityName,
           licenseId: licenseId,
+          clusterId: model.id,
           licenseState: model.license?.state || 'community',
           version: model.version.version,
           storageType: model.storageType,
           replicationMode: model.replicationMode,
-          isEnterprise: Boolean(model.license),
+          // Use the version service (resolved in the parent `vault` route via
+          // fetchType) rather than `model.license`, which is loaded by a separate
+          // license fetch and is frequently null here — making an enterprise
+          // cluster report productPlanName "community".
+          isEnterprise: this.version.isEnterprise,
+          isHvdManaged: this.flagsService.isHvdManaged,
         });
       } catch (e) {
         console.error('unable to start analytics', e);

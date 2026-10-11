@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2016, 2025
+// Copyright IBM Corp. 2016, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package rotation
@@ -27,19 +27,7 @@ func TestConfigureRotationJob(t *testing.T) {
 				RotationPeriod:                 0,
 				MigratedLegacyNextRotationTime: time.Time{},
 			},
-			expectedError: "RotationSchedule or RotationPeriod is required to set up rotation job",
-		},
-		{
-			name: "no mount point",
-			req: &RotationJobConfigureRequest{
-				MountPoint:                     "",
-				ReqPath:                        "config/root",
-				RotationSchedule:               "",
-				RotationWindow:                 60,
-				RotationPeriod:                 5,
-				MigratedLegacyNextRotationTime: time.Time{},
-			},
-			expectedError: "MountPoint is required",
+			expectedError: "must specify either rotation_schedule or rotation_period to register a rotation job",
 		},
 		{
 			name: "no req path",

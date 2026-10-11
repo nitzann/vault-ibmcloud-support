@@ -68,6 +68,10 @@ data "aws_ami" "amzn_2" {
   }
 
   owners = [local.amazon_owner_id]
+
+  timeouts {
+    read = "5m"
+  }
 }
 
 data "aws_ami" "amzn_2023" {
@@ -85,6 +89,10 @@ data "aws_ami" "amzn_2023" {
   }
 
   owners = [local.amazon_owner_id]
+
+  timeouts {
+    read = "5m"
+  }
 }
 
 data "aws_ami" "rhel_8" {
@@ -93,7 +101,7 @@ data "aws_ami" "rhel_8" {
 
   filter {
     name   = "name"
-    values = ["RHEL-8.10*HVM_GA-20*"]
+    values = ["RHEL-8.10*HVM-20*"]
   }
 
   filter {
@@ -107,6 +115,10 @@ data "aws_ami" "rhel_8" {
   }
 
   owners = [local.redhat_owner_id]
+
+  timeouts {
+    read = "5m"
+  }
 }
 
 data "aws_ami" "rhel_9" {
@@ -115,7 +127,7 @@ data "aws_ami" "rhel_9" {
 
   filter {
     name   = "name"
-    values = ["RHEL-9.7*HVM_GA-20*"]
+    values = ["RHEL-9.7*HVM-20*"]
   }
 
   filter {
@@ -129,6 +141,10 @@ data "aws_ami" "rhel_9" {
   }
 
   owners = [local.redhat_owner_id]
+
+  timeouts {
+    read = "5m"
+  }
 }
 
 data "aws_ami" "rhel_10" {
@@ -137,7 +153,7 @@ data "aws_ami" "rhel_10" {
 
   filter {
     name   = "name"
-    values = ["RHEL-10.1*HVM_GA-20*"]
+    values = ["RHEL-10.1*HVM-20*"]
   }
 
   filter {
@@ -151,6 +167,10 @@ data "aws_ami" "rhel_10" {
   }
 
   owners = [local.redhat_owner_id]
+
+  timeouts {
+    read = "5m"
+  }
 }
 
 data "aws_ami" "sles_15" {
@@ -168,6 +188,10 @@ data "aws_ami" "sles_15" {
   }
 
   owners = [local.suse_owner_id]
+
+  timeouts {
+    read = "5m"
+  }
 }
 
 data "aws_ami" "sles_16" {
@@ -185,6 +209,10 @@ data "aws_ami" "sles_16" {
   }
 
   owners = [local.suse_owner_id]
+
+  timeouts {
+    read = "5m"
+  }
 }
 
 data "aws_ami" "ubuntu_2204" {
@@ -207,6 +235,10 @@ data "aws_ami" "ubuntu_2204" {
   }
 
   owners = [local.canonical_owner_id]
+
+  timeouts {
+    read = "5m"
+  }
 }
 
 data "aws_ami" "ubuntu_2404" {
@@ -229,6 +261,10 @@ data "aws_ami" "ubuntu_2404" {
   }
 
   owners = [local.canonical_owner_id]
+
+  timeouts {
+    read = "5m"
+  }
 }
 
 data "aws_ami" "ubuntu_2604" {
@@ -251,6 +287,10 @@ data "aws_ami" "ubuntu_2604" {
   }
 
   owners = [local.canonical_owner_id]
+
+  timeouts {
+    read = "5m"
+  }
 }
 
 data "aws_region" "current" {}
@@ -262,6 +302,10 @@ data "aws_availability_zones" "available" {
     name   = "zone-name"
     values = ["*"]
   }
+
+  timeouts {
+    read = "5m"
+  }
 }
 
 output "ami_ids" {
@@ -269,7 +313,7 @@ output "ami_ids" {
 }
 
 output "current_region" {
-  value = data.aws_region.current.name
+  value = data.aws_region.current.region
 }
 
 output "availability_zones" {

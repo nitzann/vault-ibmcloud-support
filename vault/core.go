@@ -28,12 +28,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/armon/go-metrics"
 	"github.com/hashicorp/errwrap"
 	log "github.com/hashicorp/go-hclog"
 	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
 	aeadwrapper "github.com/hashicorp/go-kms-wrapping/wrappers/aead/v2"
-	"github.com/hashicorp/go-kms-wrapping/wrappers/awskms/v2"
+	"github.com/hashicorp/go-kms-wrapping/wrappers/awskms/v4"
+	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-secure-stdlib/mlock"
 	"github.com/hashicorp/go-secure-stdlib/reloadutil"
@@ -44,14 +44,16 @@ import (
 	kv "github.com/hashicorp/vault-plugin-secrets-kv"
 	"github.com/hashicorp/vault/api"
 	"github.com/hashicorp/vault/audit"
-	"github.com/hashicorp/vault/command/server"
 	"github.com/hashicorp/vault/helper/activationflags"
+	"github.com/hashicorp/vault/helper/cache"
 	"github.com/hashicorp/vault/helper/identity/mfa"
 	"github.com/hashicorp/vault/helper/locking"
-	"github.com/hashicorp/vault/helper/metricsutil"
-	"github.com/hashicorp/vault/helper/namespace"
-	"github.com/hashicorp/vault/helper/osutil"
+	server "github.com/hashicorp/vault/helper/serverconfig"
 	"github.com/hashicorp/vault/helper/trace"
+	"github.com/hashicorp/vault/internalshared/configutil"
+	"github.com/hashicorp/vault/internalshared/metricsutil"
+	"github.com/hashicorp/vault/internalshared/namespace"
+	"github.com/hashicorp/vault/internalshared/osutil"
 	"github.com/hashicorp/vault/physical/raft"
 	"github.com/hashicorp/vault/sdk/helper/certutil"
 	"github.com/hashicorp/vault/sdk/helper/consts"
@@ -71,7 +73,7 @@ import (
 	"github.com/hashicorp/vault/vault/quotas"
 	vaultseal "github.com/hashicorp/vault/vault/seal"
 	"github.com/hashicorp/vault/version"
-	"github.com/patrickmn/go-cache"
+	ttlcache "github.com/jellydator/ttlcache/v3"
 	uberAtomic "go.uber.org/atomic"
 	"google.golang.org/grpc"
 )
@@ -307,9 +309,6 @@ type Core struct {
 	// serviceRegistration is the ServiceRegistration network
 	serviceRegistration sr.ServiceRegistration
 
-	// hcpLinkStatus is a string describing the status of HCP link connection
-	hcpLinkStatus HCPLinkStatus
-
 	// underlyingPhysical will always point to the underlying backend
 	// implementation. This is an un-trusted backend with durable data
 	underlyingPhysical physical.Backend
@@ -444,6 +443,9 @@ type Core struct {
 	// the rotation manager handles periodic rotation of credentials
 	rotationManager *RotationManager
 
+	// the healthCheck manager handles all health check operations
+	healthCheckManager *HealthCheckManager
+
 	// rollback manager is used to run rollbacks periodically
 	rollback *RollbackManager
 
@@ -557,7 +559,7 @@ type Core struct {
 	// Current cluster leader values
 	clusterLeaderParams *atomic.Value
 	// Info on cluster members
-	clusterPeerClusterAddrsCache *cache.Cache
+	clusterPeerClusterAddrsCache *ttlcache.Cache[string, nodeHAConnectionInfo]
 	// The context for the client
 	rpcClientConnContext context.Context
 	// The function for canceling the client connection
@@ -739,6 +741,9 @@ type Core struct {
 	// disableSSCTokens is used to disable server side consistent token creation/usage
 	disableSSCTokens bool
 
+	// denySlashInTemplatedPolicyPaths controls whether "/" is denied in templated policy paths
+	denySlashInTemplatedPolicyPaths bool
+
 	// versionHistory is a map of vault versions to VaultVersion. The
 	// VaultVersion.TimestampInstalled when the version will denote when the version
 	// was first run. Note that because perf standbys should be upgraded first, and
@@ -799,7 +804,27 @@ type Core struct {
 	// billing purposes.
 	certCountManager cert_count.CertificateCountManager
 
-	agentRegistry *AgentRegistry
+	certCountConsumerJobInterval time.Duration
+
+	agentRegistry               *AgentRegistry
+	administrativeNamespacePath string
+	operatorNamespacePath       string
+
+	// synctest disables the short sleep when an ALPN handler is to be
+	// stopped, giving time for RPC requests to drain.  It also means that we
+	// don't sleep during polling to see whether a cache expiry goroutine is
+	// started.
+	synctest bool
+
+	// SecureHubManager holds information regarding the node's connection to the secure hub.
+	// It will be initialized to a no-op structure on CE. Access it through
+	// GetSecureHubManager/SetSecureHubManager, which take secureHubManagerLock.
+	SecureHubManager *SecureHubManager
+
+	// secureHubManagerLock protects the SecureHubManager pointer. It does not
+	// protect the manager's own in-memory state, which is guarded by the
+	// manager's internal locks.
+	secureHubManagerLock sync.RWMutex
 }
 
 func (c *Core) ActiveNodeClockSkewMillis() int64 {
@@ -958,6 +983,8 @@ type CoreConfig struct {
 	// BillingConfig contains override values for billing
 	BillingConfig billing.BillingConfig
 
+	CertCountConsumerJobInterval time.Duration
+
 	// number of workers to use for lease revocation in the expiration manager
 	NumExpirationWorkers int
 
@@ -988,6 +1015,9 @@ type CoreConfig struct {
 	// only accessible in the root namespace, currently sys/audit-hash and sys/monitor.
 	AdministrativeNamespacePath string
 
+	// OperatorNamespacePath is used to configure the operator namespace path.
+	OperatorNamespacePath string
+
 	// ObservationSystemConfig is the config for the Observation System
 	ObservationSystemConfig *observations.ObservationSystemConfig
 
@@ -1006,6 +1036,14 @@ type CoreConfig struct {
 	// These aren't the actual paths to endpoints, but rather specific values that
 	// identify groups of endpoints, e.g. "rekey" refers to the sys/rekey/* endpoints.
 	EnableUnauthenticatedAccess []string
+
+	// DenySlashInTemplatedPolicyPaths controls whether "/" is denied in templated policy paths
+	// When true, "/" in template output will cause an error
+	// When false (default), "/" is allowed
+	DenySlashInTemplatedPolicyPaths bool
+
+	// Synctest should be true when running within a synctest.Test bubble.
+	Synctest bool
 }
 
 // GetServiceRegistration returns the config's ServiceRegistration, or nil if it does
@@ -1072,6 +1110,16 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 	if conf.RawConfig == nil {
 		conf.RawConfig = new(server.Config)
 	}
+	// Ensure SharedConfig exists so promoted fields are accessible.
+	if conf.RawConfig.SharedConfig == nil {
+		conf.RawConfig.SharedConfig = new(configutil.SharedConfig)
+	}
+	// Backfill AdministrativeNamespacePath into RawConfig when callers (e.g.
+	// tests) set it only on CoreConfig. RawConfig is the live-reloadable source
+	// of truth read by AdministrativeNamespacePath(), so it must be populated.
+	if conf.RawConfig.AdministrativeNamespacePath == "" && conf.AdministrativeNamespacePath != "" {
+		conf.RawConfig.AdministrativeNamespacePath = conf.AdministrativeNamespacePath
+	}
 
 	// secureRandomReader cannot be nil
 	if conf.SecureRandomReader == nil {
@@ -1130,73 +1178,76 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 		logger:               conf.Logger.Named("core"),
 		logLevel:             conf.LogLevel,
 
-		defaultLeaseTTL:                conf.DefaultLeaseTTL,
-		maxLeaseTTL:                    conf.MaxLeaseTTL,
-		removeIrrevocableLeaseAfter:    conf.RemoveIrrevocableLeaseAfter,
-		sentinelTraceDisabled:          conf.DisableSentinelTrace,
-		cachingDisabled:                conf.DisableCache,
-		clusterName:                    conf.ClusterName,
-		clusterNetworkLayer:            conf.ClusterNetworkLayer,
-		clusterPeerClusterAddrsCache:   cache.New(3*clusterHeartbeatInterval, time.Second),
-		enableMlock:                    !conf.DisableMlock,
-		rawEnabled:                     conf.EnableRaw,
-		introspectionEnabled:           conf.EnableIntrospection,
-		shutdownDoneCh:                 new(atomic.Value),
-		replicationState:               new(uint32),
-		localClusterPrivateKey:         new(atomic.Value),
-		localClusterCert:               new(atomic.Value),
-		localClusterParsedCert:         new(atomic.Value),
-		activeNodeReplicationState:     new(uint32),
-		keepHALockOnStepDown:           new(uint32),
-		replicationFailure:             new(uint32),
-		disablePerfStandby:             true,
-		activeContextCancelFunc:        new(atomic.Value),
-		allLoggers:                     conf.AllLoggers,
-		builtinRegistry:                conf.BuiltinRegistry,
-		neverBecomeActive:              new(uint32),
-		clusterLeaderParams:            new(atomic.Value),
-		metricsHelper:                  conf.MetricsHelper,
-		metricSink:                     conf.MetricSink,
-		secureRandomReader:             conf.SecureRandomReader,
-		rawConfig:                      new(atomic.Value),
-		recoveryMode:                   conf.RecoveryMode,
-		postUnsealStarted:              new(uint32),
-		raftInfo:                       new(atomic.Value),
-		raftJoinDoneCh:                 make(chan struct{}),
-		raftJoinRetryLimiter:           make(chan struct{}, raftMaxConcurrentRetryJoins),
-		clusterHeartbeatInterval:       clusterHeartbeatInterval,
-		activityLogConfig:              conf.ActivityLogConfig,
-		billingConfig:                  conf.BillingConfig,
-		keyRotateGracePeriod:           new(int64),
-		numExpirationWorkers:           conf.NumExpirationWorkers,
-		raftFollowerStates:             raft.NewFollowerStates(),
-		disableAutopilot:               conf.DisableAutopilot,
-		allowAuditLogPrefixing:         conf.AllowAuditLogPrefixing,
-		enableResponseHeaderHostname:   conf.EnableResponseHeaderHostname,
-		enableResponseHeaderRaftNodeID: conf.EnableResponseHeaderRaftNodeID,
-		mountMigrationTracker:          &sync.Map{},
-		disableSSCTokens:               conf.DisableSSCTokens,
-		effectiveSDKVersion:            effectiveSDKVersion,
-		userFailedLoginInfo:            make(map[FailedLoginUser]*FailedLoginInfo),
-		experiments:                    conf.Experiments,
-		pendingRemovalMountsAllowed:    conf.PendingRemovalMountsAllowed,
-		expirationRevokeRetryBase:      conf.ExpirationRevokeRetryBase,
-		rollbackMountPathMetrics:       conf.MetricSink.TelemetryConsts.RollbackMetricsIncludeMountPoint,
-		numRollbackWorkers:             conf.NumRollbackWorkers,
-		impreciseLeaseRoleTracking:     conf.ImpreciseLeaseRoleTracking,
-		WellKnownRedirects:             NewWellKnownRedirects(),
-		detectDeadlocks:                detectDeadlocks,
-		echoDuration:                   uberAtomic.NewDuration(0),
-		activeNodeClockSkewMillis:      uberAtomic.NewInt64(0),
-		periodicLeaderRefreshInterval:  conf.PeriodicLeaderRefreshInterval,
-		rpcLastSuccessfulHeartbeat:     new(atomic.Value),
-		reportingScanDirectory:         conf.ReportingScanDirectory,
-		enableUnauthRekey:              new(atomic.Bool),
-		enableUnauthGenerateRoot:       new(atomic.Bool),
-		enableUnauthDROperationToken:   new(atomic.Bool),
+		defaultLeaseTTL:                 conf.DefaultLeaseTTL,
+		maxLeaseTTL:                     conf.MaxLeaseTTL,
+		removeIrrevocableLeaseAfter:     conf.RemoveIrrevocableLeaseAfter,
+		sentinelTraceDisabled:           conf.DisableSentinelTrace,
+		cachingDisabled:                 conf.DisableCache,
+		clusterName:                     conf.ClusterName,
+		clusterNetworkLayer:             conf.ClusterNetworkLayer,
+		clusterPeerClusterAddrsCache:    ttlcache.New[string, nodeHAConnectionInfo](ttlcache.WithTTL[string, nodeHAConnectionInfo](3 * clusterHeartbeatInterval)),
+		enableMlock:                     !conf.DisableMlock,
+		rawEnabled:                      conf.EnableRaw,
+		introspectionEnabled:            conf.EnableIntrospection,
+		shutdownDoneCh:                  new(atomic.Value),
+		replicationState:                new(uint32),
+		localClusterPrivateKey:          new(atomic.Value),
+		localClusterCert:                new(atomic.Value),
+		localClusterParsedCert:          new(atomic.Value),
+		activeNodeReplicationState:      new(uint32),
+		keepHALockOnStepDown:            new(uint32),
+		replicationFailure:              new(uint32),
+		disablePerfStandby:              true,
+		activeContextCancelFunc:         new(atomic.Value),
+		allLoggers:                      conf.AllLoggers,
+		builtinRegistry:                 conf.BuiltinRegistry,
+		neverBecomeActive:               new(uint32),
+		clusterLeaderParams:             new(atomic.Value),
+		metricsHelper:                   conf.MetricsHelper,
+		metricSink:                      conf.MetricSink,
+		secureRandomReader:              conf.SecureRandomReader,
+		rawConfig:                       new(atomic.Value),
+		recoveryMode:                    conf.RecoveryMode,
+		postUnsealStarted:               new(uint32),
+		raftInfo:                        new(atomic.Value),
+		raftJoinDoneCh:                  make(chan struct{}),
+		raftJoinRetryLimiter:            make(chan struct{}, raftMaxConcurrentRetryJoins),
+		clusterHeartbeatInterval:        clusterHeartbeatInterval,
+		activityLogConfig:               conf.ActivityLogConfig,
+		billingConfig:                   conf.BillingConfig,
+		keyRotateGracePeriod:            new(int64),
+		numExpirationWorkers:            conf.NumExpirationWorkers,
+		raftFollowerStates:              raft.NewFollowerStates(),
+		disableAutopilot:                conf.DisableAutopilot,
+		allowAuditLogPrefixing:          conf.AllowAuditLogPrefixing,
+		enableResponseHeaderHostname:    conf.EnableResponseHeaderHostname,
+		enableResponseHeaderRaftNodeID:  conf.EnableResponseHeaderRaftNodeID,
+		mountMigrationTracker:           &sync.Map{},
+		disableSSCTokens:                conf.DisableSSCTokens,
+		effectiveSDKVersion:             effectiveSDKVersion,
+		userFailedLoginInfo:             make(map[FailedLoginUser]*FailedLoginInfo),
+		experiments:                     conf.Experiments,
+		pendingRemovalMountsAllowed:     conf.PendingRemovalMountsAllowed,
+		expirationRevokeRetryBase:       conf.ExpirationRevokeRetryBase,
+		rollbackMountPathMetrics:        conf.MetricSink.TelemetryConsts.RollbackMetricsIncludeMountPoint,
+		numRollbackWorkers:              conf.NumRollbackWorkers,
+		impreciseLeaseRoleTracking:      conf.ImpreciseLeaseRoleTracking,
+		WellKnownRedirects:              NewWellKnownRedirects(),
+		detectDeadlocks:                 detectDeadlocks,
+		echoDuration:                    uberAtomic.NewDuration(0),
+		activeNodeClockSkewMillis:       uberAtomic.NewInt64(0),
+		periodicLeaderRefreshInterval:   conf.PeriodicLeaderRefreshInterval,
+		rpcLastSuccessfulHeartbeat:      new(atomic.Value),
+		reportingScanDirectory:          conf.ReportingScanDirectory,
+		enableUnauthRekey:               new(atomic.Bool),
+		enableUnauthGenerateRoot:        new(atomic.Bool),
+		enableUnauthDROperationToken:    new(atomic.Bool),
+		denySlashInTemplatedPolicyPaths: conf.DenySlashInTemplatedPolicyPaths,
+		certCountConsumerJobInterval:    conf.CertCountConsumerJobInterval,
+		synctest:                        conf.Synctest,
 	}
 
-	c.certCountManager = cert_count.InitCertificateCountManager(c.logger)
+	c.certCountManager = cert_count.InitCertificateCountManager(c.logger, c.certCountConsumerJobInterval)
 
 	c.standbyStopCh.Store(make(chan struct{}))
 	atomic.StoreUint32(c.sealed, 1)
@@ -1225,13 +1276,8 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 
 	c.clusterLeaderParams.Store((*ClusterLeaderParams)(nil))
 	c.clusterAddr.Store(conf.ClusterAddr)
-	c.activeContextCancelFunc.Store((context.CancelFunc)(nil))
+	c.activeContextCancelFunc.Store(context.CancelFunc(nil))
 	atomic.StoreInt64(c.keyRotateGracePeriod, int64(2*time.Minute))
-
-	c.hcpLinkStatus = HCPLinkStatus{
-		lock:             sync.RWMutex{},
-		ConnectionStatus: "disconnected",
-	}
 
 	c.raftInfo.Store((*raftInformation)(nil))
 
@@ -1402,7 +1448,7 @@ func NewCore(conf *CoreConfig) (*Core, error) {
 	}
 
 	// Logical backends
-	c.configureLogicalBackends(conf.LogicalBackends, conf.Logger, conf.AdministrativeNamespacePath)
+	c.configureLogicalBackends(conf.LogicalBackends, conf.Logger)
 
 	// Credentials backends
 	c.configureCredentialsBackends(conf.CredentialBackends, conf.Logger)
@@ -1457,6 +1503,9 @@ func NewCore(conf *CoreConfig) (*Core, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Initialize SecureHubManager after barrier is set up
+	c.SetSecureHubManager(NewSecureHubManager(c))
 
 	// Events
 	eventsLogger := conf.Logger.Named("events")
@@ -1602,7 +1651,7 @@ func (c *Core) configureCredentialsBackends(backends map[string]logical.Factory,
 
 // configureLogicalBackends configures the Core with the ability to create
 // logical backends for various types.
-func (c *Core) configureLogicalBackends(backends map[string]logical.Factory, logger log.Logger, adminNamespacePath string) {
+func (c *Core) configureLogicalBackends(backends map[string]logical.Factory, logger log.Logger) {
 	logicalBackends := make(map[string]logical.Factory, len(backends))
 
 	for k, f := range backends {
@@ -1664,7 +1713,7 @@ func (c *Core) configureLogicalBackends(backends map[string]logical.Factory, log
 
 	c.logicalBackends = logicalBackends
 
-	c.addExtraLogicalBackends(adminNamespacePath)
+	c.addExtraLogicalBackends()
 }
 
 // handleVersionTimeStamps stores the current version at the current time to
@@ -2292,8 +2341,15 @@ func (c *Core) unsealInternal(ctx context.Context, masterKey []byte) error {
 			return err
 		}
 
+		if cancelIface := c.activeContextCancelFunc.Load(); cancelIface != nil {
+			if cancel, _ := cancelIface.(context.CancelFunc); cancel != nil {
+				cancel()
+			}
+		}
 		ctx, ctxCancel := context.WithCancel(namespace.RootContext(nil))
-		if err := c.postUnseal(ctx, ctxCancel, standardUnsealStrategy{}); err != nil {
+		c.activeContext = ctx
+		c.activeContextCancelFunc.Store(ctxCancel)
+		if err := c.postUnseal(ctx, standardUnsealStrategy{}); err != nil {
 			c.logger.Error("post-unseal setup failed", "error", err)
 			c.barrier.Seal()
 			c.logger.Warn("vault is sealed")
@@ -2307,6 +2363,15 @@ func (c *Core) unsealInternal(ctx context.Context, masterKey []byte) error {
 
 		c.standby = false
 	} else {
+		// Populate the metric sink cluster name from the barrier now that it is
+		// unsealed. This ensures standby nodes emit metrics with the correct
+		// cluster label even when the cluster name was auto-generated.
+		if err := c.loadCluster(ctx); err != nil {
+			// A warn is sufficient here since this is a best-effort enrichment of metric
+			// labels on a standby node. Aborting the unseal over this is unnecessary.
+			c.logger.Warn("failed to load cluster info for standby metrics", "error", err)
+		}
+
 		// Go to standby mode, wait until we are active to unseal
 		c.standbyDoneCh = make(chan struct{})
 		c.manualStepDownCh = make(chan struct{}, 1)
@@ -2850,6 +2915,10 @@ func buildUnsealSetupFunctionSlice(c *Core, isActive bool) []func(context.Contex
 		func(ctx context.Context) error {
 			return c.EntSetupUIDefaultAuth(ctx)
 		},
+		func(_ context.Context) error {
+			c.EntSetupUIChecklistState()
+			return nil
+		},
 	}
 
 	// If this server is not part of a Disaster Recovery secondary cluster,
@@ -2872,8 +2941,20 @@ func buildUnsealSetupFunctionSlice(c *Core, isActive bool) []func(context.Contex
 		setupFunctions = append(setupFunctions, func(_ context.Context) error {
 			return c.setupExpiration(expireLeaseStrategyFairsharing)
 		})
+		setupFunctions = append(setupFunctions, func(ctx context.Context) error {
+			return c.setupOAuthTokenDenylist(ctx)
+		})
+		setupFunctions = append(setupFunctions, func(ctx context.Context) error {
+			return c.migrateProfilesByIssuerIndex(ctx)
+		})
+		setupFunctions = append(setupFunctions, func(ctx context.Context) error {
+			return c.setupOAuthResourceServerConfigManager(ctx)
+		})
 		setupFunctions = append(setupFunctions, func(_ context.Context) error {
 			return c.startRotation()
+		})
+		setupFunctions = append(setupFunctions, func(ctx context.Context) error {
+			return c.setupHealthCheckManager()
 		})
 		setupFunctions = append(setupFunctions, c.loadAudits)
 		setupFunctions = append(setupFunctions, c.setupAuditedHeadersConfig)
@@ -2895,6 +2976,10 @@ func buildUnsealSetupFunctionSlice(c *Core, isActive bool) []func(context.Contex
 
 		setupFunctions = append(setupFunctions, func(ctx context.Context) error {
 			return c.EntSetupUIDefaultAuth(ctx)
+		})
+		setupFunctions = append(setupFunctions, func(_ context.Context) error {
+			c.EntSetupUIChecklistState()
+			return nil
 		})
 		setupFunctions = append(setupFunctions, func(ctx context.Context) error {
 			if c.agentRegistry == nil {
@@ -2993,7 +3078,7 @@ func (c *Core) handleMultisealRewrapping(ctx context.Context, logger log.Logger)
 // allowing any user operations. This allows us to setup any state that
 // requires the Vault to be unsealed such as mount tables, logical backends,
 // credential stores, etc.
-func (c *Core) postUnseal(ctx context.Context, ctxCancelFunc context.CancelFunc, unsealer UnsealStrategy) (retErr error) {
+func (c *Core) postUnseal(ctx context.Context, unsealer UnsealStrategy) (retErr error) {
 	if stopTrace := c.tracePostUnsealIfEnabled(); stopTrace != nil {
 		defer stopTrace()
 	}
@@ -3003,13 +3088,8 @@ func (c *Core) postUnseal(ctx context.Context, ctxCancelFunc context.CancelFunc,
 	// Clear any out
 	c.postUnsealFuncs = nil
 
-	// Create a new request context
-	c.activeContext = ctx
-	c.activeContextCancelFunc.Store(ctxCancelFunc)
-
 	defer func() {
 		if retErr != nil {
-			ctxCancelFunc()
 			_ = c.preSeal()
 		}
 	}()
@@ -3098,15 +3178,20 @@ func (c *Core) postUnseal(ctx context.Context, ctxCancelFunc context.CancelFunc,
 	if os.Getenv(EnvVaultDisableLocalAuthMountEntities) != "" {
 		c.logger.Warn("disabling entities for local auth mounts through env var", "env", EnvVaultDisableLocalAuthMountEntities)
 	}
-	c.loginMFABackend.usedCodes = cache.New(0, 30*time.Second)
+	c.loginMFABackend.usedCodes = ttlcache.New[string, any]()
+	cache.Start(ctx, c.loginMFABackend.usedCodes, !c.synctest)
 	if c.systemBackend != nil && c.systemBackend.mfaBackend != nil {
-		c.systemBackend.mfaBackend.usedCodes = cache.New(0, 30*time.Second)
+		c.systemBackend.mfaBackend.usedCodes = ttlcache.New[string, any]()
+		cache.Start(ctx, c.systemBackend.mfaBackend.usedCodes, !c.synctest)
 	}
+	cache.Start(ctx, c.clusterPeerClusterAddrsCache, !c.synctest)
+
 	if c.systemBackend != nil {
 		// all mounts need to be initialized before activity log reporting
 		// starts, which happens in the post-unseal functions above.
 		sysActivityLogReporting(c.systemBackend)
 	}
+
 	c.logger.Info("post-unseal setup complete")
 	return nil
 }
@@ -3232,8 +3317,12 @@ func (c *Core) preSeal() error {
 	}
 
 	if c.systemBackend != nil && c.systemBackend.mfaBackend != nil {
-		c.systemBackend.mfaBackend.usedCodes = nil
+		if c.systemBackend.mfaBackend.usedCodes != nil {
+			c.systemBackend.mfaBackend.usedCodes.Stop()
+			c.systemBackend.mfaBackend.usedCodes = nil
+		}
 	}
+	c.clusterPeerClusterAddrsCache.Stop()
 	if err := c.teardownLoginMFA(); err != nil {
 		result = multierror.Append(result, fmt.Errorf("error tearing down login MFA, error: %w", err))
 	}
@@ -3912,13 +4001,23 @@ func (c *Core) LogFormat() string {
 	return conf.(*server.Config).LogFormat
 }
 
-// administrativeNamespacePath returns the configured administrative namespace path.
-func (c *Core) administrativeNamespacePath() string {
-	conf := c.rawConfig.Load()
-	if conf == nil {
-		return ""
+// AdministrativeNamespacePath returns the configured administrative namespace path.
+// It reads from rawConfig so that a live SIGHUP / SetConfig update is reflected immediately.
+// Falls back to the cached field when rawConfig has not been populated (e.g. in unit tests
+// that construct a bare Core without going through NewCore).
+func (c *Core) AdministrativeNamespacePath() string {
+	if conf := c.rawConfig.Load(); conf != nil {
+		return conf.(*server.Config).AdministrativeNamespacePath
 	}
-	return conf.(*server.Config).AdministrativeNamespacePath
+	return c.administrativeNamespacePath
+}
+
+// OperatorNamespacePath returns the configured operator namespace path. If set,
+// this namespace will be created if it doesn't exist, and operator APIs will
+// only be available in the configured path. An empty path means that operator
+// APIs will remain in the root namespace, as normal.
+func (c *Core) OperatorNamespacePath() string {
+	return c.operatorNamespacePath
 }
 
 // LogLevel returns the log level provided by level provided by config, CLI flag, or env
@@ -4029,9 +4128,10 @@ func (c *Core) setupQuotas(ctx context.Context, isPerfStandby bool) error {
 	}
 
 	qmFlags := &quotas.ManagerFlags{
-		IsPerfStandby: isPerfStandby,
-		IsDRSecondary: c.IsDRSecondary(),
-		IsNewInstall:  c.IsNewInstall(ctx),
+		IsPerfStandby:         isPerfStandby,
+		IsDRSecondary:         c.IsDRSecondary(),
+		IsNewInstall:          c.IsNewInstall(ctx),
+		OperatorNamespacePath: c.operatorNamespacePath,
 	}
 
 	return c.quotaManager.Setup(ctx, c.systemBarrierView, qmFlags)
@@ -4575,7 +4675,7 @@ type PeerNode struct {
 func (c *Core) GetHAPeerNodesCached() []PeerNode {
 	var nodes []PeerNode
 	for itemClusterAddr, item := range c.clusterPeerClusterAddrsCache.Items() {
-		info := item.Object.(nodeHAConnectionInfo)
+		info := item.Value()
 		var hostname, apiAddr string
 
 		// nodeInfo can be nil if there's a node with a much older version in
@@ -4685,7 +4785,7 @@ func (c *Core) doResolveRoleLocked(ctx context.Context, mountPoint string, data 
 		req.Headers = filteredHeaders(headers, passthroughRequestHeaders, deniedPassthroughRequestHeaders)
 	}
 	resp, err := be.HandleRequest(ctx, req)
-	if err != nil || resp.Data["role"] == nil {
+	if err != nil || resp == nil || resp.Data == nil || resp.Data["role"] == nil {
 		return ""
 	}
 
@@ -4728,7 +4828,7 @@ func (c *Core) aliasNameFromLoginRequest(ctx context.Context, req *logical.Reque
 		Data:       req.Data,
 		Storage:    c.router.MatchingStorageByAPIPath(ctx, req.Path),
 	})
-	if err != nil || resp.Auth.Alias == nil {
+	if err != nil || resp == nil || resp.Auth == nil || resp.Auth.Alias == nil {
 		return "", nil
 	}
 	return resp.Auth.Alias.Name, nil
@@ -4816,29 +4916,6 @@ func (c *Core) SetGroupPolicyApplicationMode(ctx context.Context, mode string) e
 		Key:   coreGroupPolicyApplicationPath,
 		Value: json,
 	})
-}
-
-type HCPLinkStatus struct {
-	lock             sync.RWMutex
-	ConnectionStatus string `json:"hcp_link_status,omitempty"`
-	ResourceIDOnHCP  string `json:"resource_ID_on_hcp,omitempty"`
-}
-
-func (c *Core) SetHCPLinkStatus(status, resourceID string) {
-	c.hcpLinkStatus.lock.Lock()
-	defer c.hcpLinkStatus.lock.Unlock()
-	c.hcpLinkStatus.ConnectionStatus = status
-	c.hcpLinkStatus.ResourceIDOnHCP = resourceID
-}
-
-func (c *Core) GetHCPLinkStatus() (string, string) {
-	c.hcpLinkStatus.lock.RLock()
-	defer c.hcpLinkStatus.lock.RUnlock()
-
-	status := c.hcpLinkStatus.ConnectionStatus
-	resourceID := c.hcpLinkStatus.ResourceIDOnHCP
-
-	return status, resourceID
 }
 
 // IsExperimentEnabled is true if the experiment is enabled in the core.
