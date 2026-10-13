@@ -44,7 +44,7 @@
 # and checking for disallowed changed files.
 
 set -eou pipefail
-
+export PATH="$(go env GOPATH)/bin:$PATH"
 # We need extglob in order to parse remote_url_is_enterprise
 shopt -s extglob
 
