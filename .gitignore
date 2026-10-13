@@ -157,3 +157,6 @@ scratch
 # .bob/
 .bob/notes
 .bob/tmp
+
+go1.26.4.darwin-arm64.tar.gz
+*.prv

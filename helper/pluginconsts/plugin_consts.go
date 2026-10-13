@@ -12,6 +12,7 @@ const (
 	AuthTypeCF                = "cf"
 	AuthTypeGCP               = "gcp"
 	AuthTypeGitHub            = "github"
+	AuthTypeIBMCloud          = "ibmcloud"
 	AuthTypeKerberos          = "kerberos"
 	AuthTypeKubernetes        = "kubernetes"
 	AuthTypeLDAP              = "ldap"

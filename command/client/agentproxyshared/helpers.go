@@ -20,6 +20,7 @@ import (
 	"github.com/hashicorp/vault/command/client/auth/cert"
 	"github.com/hashicorp/vault/command/client/auth/cf"
 	"github.com/hashicorp/vault/command/client/auth/gcp"
+	"github.com/hashicorp/vault/command/client/auth/ibmcloud"
 	"github.com/hashicorp/vault/command/client/auth/jwt"
 	"github.com/hashicorp/vault/command/client/auth/kerberos"
 	"github.com/hashicorp/vault/command/client/auth/kubernetes"
@@ -49,6 +50,8 @@ func GetAutoAuthMethodFromConfig(autoAuthMethodType string, authConfig *auth.Aut
 		return cf.NewCFAuthMethod(authConfig)
 	case "gcp":
 		return gcp.NewGCPAuthMethod(authConfig)
+	case "ibmcloud":
+		return ibmcloud.NewIBMCloudAuthMethod(authConfig)
 	case "jwt":
 		return jwt.NewJWTAuthMethod(authConfig)
 	case "kerberos":

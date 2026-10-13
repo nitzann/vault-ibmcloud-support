@@ -32,6 +32,7 @@ import (
 	logicalTerraform "github.com/hashicorp/vault-plugin-secrets-terraform"
 	credAws "github.com/hashicorp/vault/builtin/credential/aws"
 	credGitHub "github.com/hashicorp/vault/builtin/credential/github"
+	credIBMCloud "github.com/hashicorp/vault/builtin/credential/ibmcloud"
 	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
 	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
 	credRadius "github.com/hashicorp/vault/builtin/credential/radius"
@@ -65,6 +66,7 @@ func newFullAddonRegistry() *registry {
 			pluginconsts.AuthTypeCF:         {Factory: credCF.Factory},
 			pluginconsts.AuthTypeGCP:        {Factory: credGcp.Factory},
 			pluginconsts.AuthTypeGitHub:     {Factory: credGitHub.Factory},
+			pluginconsts.AuthTypeIBMCloud:   {Factory: credIBMCloud.Factory},
 			pluginconsts.AuthTypeKerberos:   {Factory: credKerb.Factory},
 			pluginconsts.AuthTypeKubernetes: {Factory: credKube.Factory},
 			pluginconsts.AuthTypeLDAP:       {Factory: credLdap.Factory},

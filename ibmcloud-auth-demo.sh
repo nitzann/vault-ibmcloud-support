@@ -110,11 +110,13 @@ build_vault() {
         exit 1
     fi
     
-    print_info "Running 'make dev' to build Vault..."
-    if make dev; then
+    print_info "Building Vault (skipping code generation)..."
+    print_info "Generated files are already committed to the repository"
+    if SKIP_GEN=1 make dev; then
         print_success "Vault built successfully!"
     else
         print_error "Failed to build Vault"
+        print_info "If you see 'enumer' errors, this is expected - we skip code generation"
         exit 1
     fi
     
@@ -203,7 +205,7 @@ configure_ibmcloud_auth() {
     if ${VAULT_BINARY} write auth/ibmcloud/config \
         iam_endpoint="https://iam.cloud.ibm.com" \
         metadata_endpoint="http://169.254.169.254" \
-        iam_client_timeout="30s"; then
+        iam_client_timeout=30; then
         print_success "IBM Cloud auth backend configured!"
     else
         print_warning "Failed to configure backend (expected if not yet implemented)"
@@ -627,70 +629,71 @@ main() {
         exit 0
     fi
     
-    case "$1" in
-        --build)
-            check_prerequisites
-            build_vault
-            ;;
-        --start)
-            start_vault_dev_server
-            ;;
-        --setup)
-            enable_ibmcloud_auth
-            configure_ibmcloud_auth
-            ;;
-        --create-roles)
-            create_apikey_role "demo-apikey-role" "${IBMCLOUD_ACCOUNT_ID}"
-            create_trusted_profile_role "demo-profile-role"
-            ;;
-        --test-apikey)
-            test_apikey_auth "demo-apikey-role" "${IBMCLOUD_API_KEY}"
-            ;;
-        --test-profile)
-            test_trusted_profile_auth "demo-profile-role"
-            ;;
-        --demo-agent-apikey)
-            demo_vault_agent_apikey "${IBMCLOUD_API_KEY}"
-            ;;
-        --demo-agent-profile)
-            demo_vault_agent_profile
-            ;;
-        --ibmcloud-info)
-            get_ibmcloud_info
-            ;;
-        --create-apikey)
-            create_ibmcloud_apikey
-            ;;
-        --full-demo)
-            check_prerequisites
-            build_vault
-            start_vault_dev_server
-            sleep 2
-            enable_ibmcloud_auth || print_warning "Auth method not yet implemented"
-            configure_ibmcloud_auth || print_warning "Configuration not yet available"
-            create_apikey_role "demo-apikey-role" "${IBMCLOUD_ACCOUNT_ID}" || print_warning "Role creation not yet available"
-            create_trusted_profile_role "demo-profile-role" || print_warning "Role creation not yet available"
-            print_success "Full demo setup complete!"
-            print_info "Next steps:"
-            print_info "  1. Set IBMCLOUD_API_KEY environment variable"
-            print_info "  2. Run: $0 --test-apikey"
-            ;;
-        --cleanup)
-            cleanup
-            ;;
-        --help)
-            show_usage
-            ;;
-        *)
-            print_error "Unknown option: $1"
-            show_usage
-            exit 1
-            ;;
-    esac
+    # Process each argument
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --build)
+                check_prerequisites
+                build_vault
+                ;;
+            --start)
+                start_vault_dev_server
+                ;;
+            --setup)
+                enable_ibmcloud_auth
+                configure_ibmcloud_auth
+                ;;
+            --create-roles)
+                create_apikey_role "demo-apikey-role" "${IBMCLOUD_ACCOUNT_ID}"
+                create_trusted_profile_role "demo-profile-role"
+                ;;
+            --test-apikey)
+                test_apikey_auth "demo-apikey-role" "${IBMCLOUD_API_KEY}"
+                ;;
+            --test-profile)
+                test_trusted_profile_auth "demo-profile-role"
+                ;;
+            --demo-agent-apikey)
+                demo_vault_agent_apikey "${IBMCLOUD_API_KEY}"
+                ;;
+            --demo-agent-profile)
+                demo_vault_agent_profile
+                ;;
+            --ibmcloud-info)
+                get_ibmcloud_info
+                ;;
+            --create-apikey)
+                create_ibmcloud_apikey
+                ;;
+            --full-demo)
+                check_prerequisites
+                build_vault
+                start_vault_dev_server
+                sleep 2
+                enable_ibmcloud_auth || print_warning "Auth method not yet implemented"
+                configure_ibmcloud_auth || print_warning "Configuration not yet available"
+                create_apikey_role "demo-apikey-role" "${IBMCLOUD_ACCOUNT_ID}" || print_warning "Role creation not yet available"
+                create_trusted_profile_role "demo-profile-role" || print_warning "Role creation not yet available"
+                print_success "Full demo setup complete!"
+                print_info "Next steps:"
+                print_info "  1. Set IBMCLOUD_API_KEY environment variable"
+                print_info "  2. Run: $0 --test-apikey"
+                ;;
+            --cleanup)
+                cleanup
+                ;;
+            --help)
+                show_usage
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+        shift
+    done
 }
-
-# Trap cleanup on exit
-trap cleanup EXIT
 
 # Run main function
 main "$@"

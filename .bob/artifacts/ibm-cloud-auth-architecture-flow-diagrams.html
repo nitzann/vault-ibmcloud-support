@@ -1,0 +1,608 @@
+
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>IBM Cloud Auth — Architecture &amp; Flow Diagrams</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", system-ui, sans-serif; font-size: 14px; line-height: 1.6; background: #fff; color: #1f2328; padding: 32px 20px 48px; }
+  h1 { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+  .subtitle { color: #57606a; font-size: 13px; margin-bottom: 40px; }
+  h2 { font-size: 15px; font-weight: 700; margin-bottom: 16px; color: #1f2328; border-bottom: 2px solid #e5e7eb; padding-bottom: 6px; }
+  .section { max-width: 900px; margin: 0 auto 56px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #57606a; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 3px; }
+
+  /* ── node helpers ── */
+  .node {
+    border-radius: 6px;
+    padding: 9px 13px;
+    font-size: 11.5px;
+    text-align: center;
+    min-width: 120px;
+  }
+  .node strong { display: block; font-size: 12px; }
+  .node span   { font-size: 10px; color: inherit; opacity: .8; display: block; margin-top: 2px; }
+  .n-gray   { background:#f3f4f6; border:1.5px solid #6b7280; color:#374151; }
+  .n-blue   { background:#dbeafe; border:1.5px solid #3b82d4; color:#1d4ed8; }
+  .n-cyan   { background:#e0f2fe; border:1.5px solid #0284c7; color:#0369a1; }
+  .n-green  { background:#dcfce7; border:1.5px solid #15803d; color:#15803d; }
+  .n-amber  { background:#fef3c7; border:1.5px solid #d97706; color:#92400e; }
+  .n-purple { background:#ede9fe; border:1.5px solid #7c5cd8; color:#6d28d9; }
+  .n-pink   { background:#fce7f3; border:1.5px solid #db2777; color:#9d174d; }
+
+  /* ── arrows ── */
+  .arr-h { display:flex; align-items:center; justify-content:center; flex-direction:column; padding: 0 5px; flex-shrink:0; }
+  .arr-h span { font-size:16px; color:#9ca3af; line-height:1; }
+  .arr-h small { font-size:8.5px; color:#9ca3af; white-space:nowrap; }
+  .arr-v { text-align:center; font-size:16px; color:#9ca3af; padding: 2px 0; width:100%; line-height:1; }
+  .arr-v small { display:block; font-size:8.5px; color:#9ca3af; }
+
+  /* ── layout helpers ── */
+  .row   { display:flex; align-items:center; flex-wrap:nowrap; }
+  .col   { display:flex; flex-direction:column; align-items:center; }
+  .gap8  { gap: 8px; }
+  .gap12 { gap: 12px; }
+
+  /* DIAGRAM 1 – component grid */
+  .comp-grid {
+    display: grid;
+    grid-template-columns: 180px 1fr 180px;
+    gap: 10px 0;
+    align-items: start;
+  }
+  .comp-layer {
+    background: #f7f8fa;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 14px;
+  }
+  .comp-layer h3 { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: #57606a; margin-bottom: 10px; }
+  .stack { display:flex; flex-direction:column; gap:8px; }
+  .v-join { display:flex; flex-direction:column; align-items:center; gap:4px; }
+
+  /* DIAGRAM 2/3 – sequence flow */
+  .seq {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 6px;
+    align-items: start;
+  }
+  .seq4 {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    align-items: start;
+  }
+  .seq-header { text-align:center; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing:.05em; color: #57606a; padding-bottom: 6px; border-bottom: 2px solid #e5e7eb; margin-bottom: 8px; }
+  .seq-col { display:flex; flex-direction:column; align-items:center; gap:6px; }
+  .flow-step {
+    background: #f7f8fa;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 10.5px;
+    text-align: center;
+    width: 100%;
+  }
+  .flow-step strong { display:block; font-size: 11px; margin-bottom: 2px; }
+  .step-num { display:inline-block; background:#3b82d4; color:#fff; border-radius: 50%; width:17px; height:17px; font-size:10px; font-weight:700; line-height:17px; text-align:center; margin-bottom:4px; }
+  .hl-blue   { border-color:#3b82d4; background:#dbeafe; color:#1d4ed8; }
+  .hl-green  { border-color:#15803d; background:#dcfce7; color:#15803d; }
+  .hl-amber  { border-color:#d97706; background:#fef3c7; color:#92400e; }
+  .hl-purple { border-color:#7c5cd8; background:#ede9fe; color:#6d28d9; }
+  .hl-cyan   { border-color:#0284c7; background:#e0f2fe; color:#0369a1; }
+
+  .cross-arr {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 2px 0;
+    font-size: 10px;
+    color: #9ca3af;
+  }
+  .cross-arr span { font-size:14px; }
+
+  footer { text-align:center; font-size:11px; color:#9ca3af; border-top:1px solid #e5e7eb; padding-top:14px; margin-top:40px; max-width:900px; margin-left:auto; margin-right:auto; }
+</style>
+</head>
+<body>
+
+<div style="max-width:900px;margin:0 auto">
+  <h1>IBM Cloud Auth Plugin — Architecture &amp; Flow Diagrams</h1>
+  <p class="subtitle">vault-ibmcloud-support branch · Components changed on local branch</p>
+
+  
+  <div class="section">
+    <h2>1 · Component Architecture</h2>
+
+    <div class="legend">
+      <div class="legend-item"><div class="legend-swatch" style="background:#f3f4f6;border:1px solid #6b7280"></div>Vault Core</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#dbeafe;border:1px solid #3b82d4"></div>Plugin Backend</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#e0f2fe;border:1px solid #0284c7"></div>IAM Client</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#dcfce7;border:1px solid #15803d"></div>CLI / Agent</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#fef3c7;border:1px solid #d97706"></div>IBM Cloud APIs</div>
+    </div>
+
+    
+    <div style="margin-bottom:6px">
+      <div class="comp-layer">
+        <h3>Vault Core — Registry &amp; Server</h3>
+        <div class="row gap12">
+          <div class="node n-gray" style="flex:1"><strong>plugin_consts.go</strong><span>AuthTypeIBMCloud = "ibmcloud"</span></div>
+          <div class="arr-h"><span>→</span></div>
+          <div class="node n-gray" style="flex:1"><strong>registry_full.go</strong><span>Registers credIBMCloud.Factory</span></div>
+          <div class="arr-h"><span>→</span></div>
+          <div class="node n-gray" style="flex:1"><strong>commands_full.go</strong><span>Maps "ibmcloud" → CLIHandler</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arr-v"><span>↓</span><small>Factory() called on mount</small></div>
+
+    
+    <div style="margin-bottom:6px">
+      <div class="comp-layer">
+        <h3>Auth Plugin — builtin/credential/ibmcloud/</h3>
+        <div class="row gap8" style="align-items:stretch">
+
+          
+          <div class="node n-blue" style="flex:1.2;min-width:130px">
+            <strong>backend.go</strong>
+            <span>Factory / Backend()</span>
+            <span>getAdminToken()</span>
+            <span>getIAMClient()</span>
+            <span>invalidate()</span>
+          </div>
+
+          <div class="arr-h"><span>↔</span></div>
+
+          
+          <div class="stack" style="flex:2">
+            <div class="row gap8">
+              <div class="node n-blue" style="flex:1"><strong>path_config.go</strong><span>ibmCloudConfig</span><span>CRUD /config</span></div>
+              <div class="arr-h"><span>↔</span></div>
+              <div class="node n-blue" style="flex:1"><strong>path_config_rotate_root.go</strong><span>rotate-root</span><span>API key rotation</span></div>
+            </div>
+            <div class="row gap8">
+              <div class="node n-blue" style="flex:1"><strong>path_role.go</strong><span>ibmCloudRole</span><span>CRUD /role/{name}</span><span>matchesIdentity()</span></div>
+              <div class="arr-h"><span>↔</span></div>
+              <div class="node n-blue" style="flex:1"><strong>path_login.go</strong><span>pathLoginUpdate()</span><span>authenticateAPIKey()</span><span>authenticateTrustedProfile()</span></div>
+            </div>
+          </div>
+
+          <div class="arr-h"><span>↔</span></div>
+
+          
+          <div class="node n-cyan" style="flex:1.2;min-width:130px">
+            <strong>client.go</strong>
+            <span>IBMCloudIAMClient</span>
+            <span>AuthenticateWithAPIKey()</span>
+            <span>AuthenticateWithCRToken()</span>
+            <span>ValidateToken()</span>
+            <span>CheckAccessGroup()</span>
+            <span>FetchCRToken()</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    
+    <div class="row gap8" style="margin-bottom:6px">
+      <div class="comp-layer" style="flex:1">
+        <h3>CLI — builtin/credential/ibmcloud/</h3>
+        <div class="node n-green" style="width:100%">
+          <strong>cli.go — CLIHandler</strong>
+          <span>Auth() — vault login -method=ibmcloud</span>
+          <span>Supports: apikey / trusted_profile</span>
+          <span>Reads IBMCLOUD_API_KEY env var</span>
+        </div>
+      </div>
+      <div class="arr-h"><span>→</span><small>HTTP POST</small></div>
+      <div class="comp-layer" style="flex:1">
+        <h3>Vault Agent — command/client/auth/ibmcloud/</h3>
+        <div class="node n-green" style="width:100%">
+          <strong>ibmcloud.go — ibmcloudMethod</strong>
+          <span>NewIBMCloudAuthMethod()</span>
+          <span>Authenticate() — implements auth.AuthMethod</span>
+          <span>pollForCRToken() goroutine</span>
+          <span>NewCreds() / Shutdown()</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="arr-v"><span>↓</span><small>HTTPS calls to IBM Cloud</small></div>
+
+    
+    <div class="comp-layer">
+      <h3>IBM Cloud External APIs</h3>
+      <div class="row gap8">
+        <div class="node n-amber" style="flex:1"><strong>IAM Identity Service</strong><span>POST /identity/token</span><span>POST /identity/introspect</span></div>
+        <div class="node n-amber" style="flex:1"><strong>IAM Access Management</strong><span>GET /v1/serviceids/{id}</span><span>GET /v2/accounts/{id}/users/{id}</span><span>GET /v2/groups</span></div>
+        <div class="node n-amber" style="flex:1"><strong>IAM API Key Service</strong><span>POST /v1/apikeys</span><span>GET /v1/apikeys/{id}</span><span>DELETE /v1/apikeys/{id}</span></div>
+        <div class="node n-amber" style="flex:1"><strong>VPC Metadata Service</strong><span>PUT /instance_identity/v1/token</span><span>(169.254.169.254)</span></div>
+      </div>
+    </div>
+
+  </div>
+
+
+  
+  <div class="section">
+    <h2>2 · Code Flow — IBM IAM API Key Login</h2>
+
+    
+    <div class="seq" style="margin-bottom:4px">
+      <div class="seq-header">Vault Client<br />(CLI / HTTP)</div>
+      <div class="seq-header">path_login.go<br />pathLoginUpdate()</div>
+      <div class="seq-header">client.go<br />IBMCloudIAMClient</div>
+      <div class="seq-header">IBM Cloud IAM<br />(external)</div>
+      <div class="seq-header">path_role.go<br />ibmCloudRole</div>
+    </div>
+
+    
+    <div class="seq">
+      <div class="seq-col">
+        <div class="flow-step hl-blue">
+          <div class="step-num">1</div>
+          <strong>POST /auth/ibmcloud/login</strong>
+          role=&lt;name&gt;<br />type=apikey<br />apikey=&lt;key&gt;
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step">
+          <strong>Receive request</strong>
+          Validate fields<br />Read role from storage
+        </div>
+      </div>
+      <div class="seq-col"></div>
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step">
+          <strong>role()</strong>
+          Load ibmCloudRole<br />from Vault storage
+        </div>
+      </div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> authenticateAPIKey()</div>
+
+    
+    <div class="seq">
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step hl-cyan">
+          <div class="step-num">2</div>
+          <strong>authenticateAPIKey()</strong>
+          Pass apikey to client
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step">
+          <strong>AuthenticateWithAPIKey()</strong>
+          HTTP POST /identity/token<br />grant_type=urn:ibm:params…
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step hl-amber">
+          <strong>IAM /identity/token</strong>
+          Returns: access_token<br />expires_in, expiration
+        </div>
+      </div>
+      <div class="seq-col"></div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> ValidateToken() — introspect</div>
+
+    
+    <div class="seq">
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step hl-cyan">
+          <div class="step-num">3</div>
+          <strong>ValidateToken()</strong>
+          Extract IdentityInfo<br />(IAMID, SubjectType,<br />AccountID, Subject)
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step">
+          <strong>ValidateToken()</strong>
+          HTTP POST /identity/introspect
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step hl-amber">
+          <strong>IAM /identity/introspect</strong>
+          Returns: IdentityInfo<br />iam_id, account, sub
+        </div>
+      </div>
+      <div class="seq-col"></div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> verifyAccountMembership() — dual token check</div>
+
+    
+    <div class="seq">
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step hl-cyan">
+          <div class="step-num">4</div>
+          <strong>verifyAccountMembership()</strong>
+          Use admin token<br />Check account match
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step">
+          <strong>GetServiceID() or<br />CheckUserAccount()</strong>
+          ServiceId → /v1/serviceids<br />User → /v2/accounts/.../users
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step hl-amber">
+          <strong>IAM Access Mgmt</strong>
+          Validates subject is<br />member of config account
+        </div>
+      </div>
+      <div class="seq-col"></div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> CheckAccessGroupMembership() — if role has bound_access_group_ids</div>
+
+    
+    <div class="seq">
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step hl-cyan">
+          <div class="step-num">5</div>
+          <strong>CheckAccessGroupMembership()</strong>
+          user token + admin token<br />Check group membership
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step">
+          <strong>CheckAccessGroupMembership()</strong>
+          GET /v2/groups?account_id&amp;<br />iam_id=…
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step hl-amber">
+          <strong>IAM Groups API</strong>
+          Returns group list<br />matched against role
+        </div>
+      </div>
+      <div class="seq-col"></div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> matchesIdentity() — role binding validation</div>
+
+    
+    <div class="seq">
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step hl-purple">
+          <div class="step-num">6</div>
+          <strong>role.matchesIdentity()</strong>
+          → matchesAPIKeyIdentity()<br />Check: account, serviceIDs,<br />userIDs (at least one)
+        </div>
+      </div>
+      <div class="seq-col"></div>
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step hl-purple">
+          <strong>matchesAPIKeyIdentity()</strong>
+          bound_account_id<br />bound_service_ids<br />bound_user_ids
+        </div>
+      </div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> CIDR check + build Vault auth response</div>
+
+    
+    <div class="seq">
+      <div class="seq-col">
+        <div class="flow-step hl-green">
+          <div class="step-num">7</div>
+          <strong>Vault Token Issued</strong>
+          TTL, policies from role<br />metadata: iamID, subject,<br />account_id, auth_type
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step hl-green">
+          <strong>logical.Auth{}</strong>
+          Alias: IAMID<br />Metadata map<br />Policies + TTL
+        </div>
+      </div>
+      <div class="seq-col"></div>
+      <div class="seq-col"></div>
+      <div class="seq-col"></div>
+    </div>
+
+  </div>
+
+
+  
+  <div class="section">
+    <h2>3 · Code Flow — Trusted Profile (CR Token) Login</h2>
+
+    
+    <div class="seq4" style="margin-bottom:4px">
+      <div class="seq-header">Vault Agent<br />ibmcloud.go</div>
+      <div class="seq-header">path_login.go<br />pathLoginUpdate()</div>
+      <div class="seq-header">client.go<br />IBMCloudIAMClient</div>
+      <div class="seq-header">IBM Cloud APIs<br />(IAM + VPC Metadata)</div>
+    </div>
+
+    
+    <div class="seq4">
+      <div class="seq-col">
+        <div class="flow-step hl-green">
+          <div class="step-num">1</div>
+          <strong>pollForCRToken() goroutine</strong>
+          Periodic fetch<br />PUT /instance_identity/v1/token<br />(169.254.169.254)
+        </div>
+      </div>
+      <div class="seq-col"></div>
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step hl-amber">
+          <strong>VPC Metadata Service</strong>
+          Header: Metadata-Flavor: ibm<br />Returns CR token (JWT)
+        </div>
+      </div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> Authenticate() called by Vault Agent renewal loop</div>
+
+    
+    <div class="seq4">
+      <div class="seq-col">
+        <div class="flow-step hl-green">
+          <div class="step-num">2</div>
+          <strong>Authenticate()</strong>
+          POST /auth/ibmcloud/login<br />role=&lt;name&gt;<br />type=trusted_profile<br />cr_token=&lt;jwt&gt;<br />trusted_profile_id=&lt;id&gt; (opt)
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step">
+          <strong>Receive request</strong>
+          Validate fields<br />Load role (type=trusted_profile)
+        </div>
+      </div>
+      <div class="seq-col"></div>
+      <div class="seq-col"></div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> authenticateTrustedProfile()</div>
+
+    
+    <div class="seq4">
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step hl-cyan">
+          <div class="step-num">3</div>
+          <strong>authenticateTrustedProfile()</strong>
+          If no cr_token:<br />call FetchCRToken()
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step">
+          <strong>FetchCRToken()</strong><br />
+          PUT /instance_identity/v1/token<br />Metadata-Flavor: ibm
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step hl-amber">
+          <strong>VPC Metadata</strong>
+          Returns CR token<br />(if running on VPC instance)
+        </div>
+      </div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> AuthenticateWithCRToken()</div>
+
+    
+    <div class="seq4">
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step hl-cyan">
+          <div class="step-num">4</div>
+          <strong>AuthenticateWithCRToken()</strong>
+          Exchange CR token<br />for IAM access token<br />via trusted profile binding
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step">
+          <strong>AuthenticateWithCRToken()</strong>
+          POST /identity/token<br />grant_type=urn:ibm:params:oauth:…<br />cr_token + trusted_profile_id
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step hl-amber">
+          <strong>IAM /identity/token</strong>
+          Returns IAMTokenResponse<br />access_token (scoped to<br />trusted profile)
+        </div>
+      </div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> ValidateToken() — introspect</div>
+
+    
+    <div class="seq4">
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step hl-cyan">
+          <div class="step-num">5</div>
+          <strong>ValidateToken()</strong>
+          Extract IdentityInfo<br />TrustedProfileID<br />ComputeResourceID, CRN
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step">
+          <strong>ValidateToken()</strong>
+          POST /identity/introspect
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step hl-amber">
+          <strong>IAM /identity/introspect</strong>
+          Returns: trusted_profile_id<br />compute_resource_id<br />crn, iam_id
+        </div>
+      </div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> matchesTrustedProfileIdentity()</div>
+
+    
+    <div class="seq4">
+      <div class="seq-col"></div>
+      <div class="seq-col">
+        <div class="flow-step hl-purple">
+          <div class="step-num">6</div>
+          <strong>role.matchesTrustedProfileIdentity()</strong>
+          Check bound_trusted_profile_id<br />Check bound_compute_resource_crn<br />(wildcard * patterns)<br />Check bound_compute_resource_type<br />(extracted from CRN field [8])
+        </div>
+      </div>
+      <div class="seq-col"></div>
+      <div class="seq-col"></div>
+    </div>
+
+    <div class="cross-arr"><span>↓</span> CIDR check + build Vault auth response</div>
+
+    
+    <div class="seq4">
+      <div class="seq-col">
+        <div class="flow-step hl-green">
+          <div class="step-num">7</div>
+          <strong>Vault Token Issued</strong>
+          TTL + policies from role<br />metadata: trusted_profile_id<br />compute_resource_id, crn
+        </div>
+      </div>
+      <div class="seq-col">
+        <div class="flow-step hl-green">
+          <strong>logical.Auth{}</strong>
+          Alias: IAMID<br />Metadata map<br />Policies + TTL
+        </div>
+      </div>
+      <div class="seq-col"></div>
+      <div class="seq-col"></div>
+    </div>
+
+    
+    <div style="margin-top:14px;background:#f7f8fa;border:1px solid #e5e7eb;border-radius:6px;padding:12px 16px;font-size:11px;color:#57606a">
+      <strong style="color:#1f2328">Vault Agent renewal loop:</strong>
+      After token issuance the Agent monitors the <code>credsFound</code> channel.
+      When <code>pollForCRToken()</code> detects a new CR token it signals via the channel,
+      triggering re-authentication before the current Vault token expires.
+      <code>Shutdown()</code> closes both <code>stopCh</code> and <code>credsFound</code> to terminate the goroutine cleanly.
+    </div>
+
+  </div>
+
+</div>
+
+<footer>Made with IBM Bob</footer>
+</body>
+</html>

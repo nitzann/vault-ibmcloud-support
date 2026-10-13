@@ -15,6 +15,7 @@ import (
 	credOCI "github.com/hashicorp/vault-plugin-auth-oci"
 	credAws "github.com/hashicorp/vault/builtin/credential/aws"
 	credGitHub "github.com/hashicorp/vault/builtin/credential/github"
+	credIBMCloud "github.com/hashicorp/vault/builtin/credential/ibmcloud"
 	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
 	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
 	credUserpass "github.com/hashicorp/vault/builtin/credential/userpass"
@@ -78,6 +79,7 @@ func newFullAddonHandlers() (map[string]physical.Factory, map[string]base.LoginH
 		"cf":       &credCF.CLIHandler{},
 		"gcp":      &credGcp.CLIHandler{},
 		"github":   &credGitHub.CLIHandler{},
+		"ibmcloud": &credIBMCloud.CLIHandler{},
 		"kerberos": &credKerb.CLIHandler{},
 		"ldap":     &credLdap.CLIHandler{},
 		"oci":      &credOCI.CLIHandler{},
