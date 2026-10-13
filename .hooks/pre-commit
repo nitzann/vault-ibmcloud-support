@@ -61,6 +61,7 @@ ui_lint() {
 }
 
 backend_lint() {
+  PATH="$(go env GOPATH)/bin:$PATH"
   # Silently succeed if no changes staged for Go code files.
   staged=$(git diff --name-only --cached --exit-code -- '*.go')
   ret=$?
