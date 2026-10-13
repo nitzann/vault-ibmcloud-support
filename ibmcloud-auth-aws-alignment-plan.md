@@ -49,7 +49,7 @@
   - `command/client/agent/config/config.go` (`autoAuthMethodKeys`, `normalizeAutoAuthMethod`)
   - `command/client/proxy/config/config.go` (same map and function)
   - `command/client/agent/config/config_test.go` and `command/client/proxy/config/config_test.go` (`aws` test case is the model)
-- **Status:** [ ] pending
+- **Status:** [x] done
 
 ---
 
