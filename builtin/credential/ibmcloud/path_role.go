@@ -416,7 +416,7 @@ func (r *ibmCloudRole) matchesAPIKeyIdentity(identity *IdentityInfo) error {
 
 	// Note: Access group membership is verified separately via API call in path_login.go
 	// because it's not included in the token claims and requires a separate IAM API call.
-	// See lines 141-156 in path_login.go for the actual access group verification.
+	// See pathLoginUpdate for the actual access group verification.
 
 	return nil
 }

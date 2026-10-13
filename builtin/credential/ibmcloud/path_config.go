@@ -18,9 +18,6 @@ type ibmCloudConfig struct {
 	// IAM endpoint URL
 	IAMEndpoint string `json:"iam_endpoint"`
 
-	// Metadata service endpoint URL
-	MetadataEndpoint string `json:"metadata_endpoint"`
-
 	// IAM client timeout in seconds
 	IAMClientTimeout int `json:"iam_client_timeout"`
 
@@ -52,11 +49,6 @@ func (b *backend) pathConfigIBMCloud() *framework.Path {
 				Type:        framework.TypeString,
 				Description: "IBM Cloud IAM endpoint URL. Defaults to https://iam.cloud.ibm.com",
 				Default:     defaultIAMEndpoint,
-			},
-			"metadata_endpoint": {
-				Type:        framework.TypeString,
-				Description: "VPC metadata service endpoint URL. Defaults to http://169.254.169.254",
-				Default:     defaultMetadataEndpoint,
 			},
 			"iam_client_timeout": {
 				Type:        framework.TypeInt,
@@ -137,7 +129,6 @@ func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, data
 	return &logical.Response{
 		Data: map[string]interface{}{
 			"iam_endpoint":       config.IAMEndpoint,
-			"metadata_endpoint":  config.MetadataEndpoint,
 			"iam_client_timeout": config.IAMClientTimeout,
 			"service_id":         config.ServiceID,
 			"account_id":         config.AccountID,
@@ -159,10 +150,6 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, dat
 	// Update fields if provided
 	if iamEndpoint, ok := data.GetOk("iam_endpoint"); ok {
 		config.IAMEndpoint = iamEndpoint.(string)
-	}
-
-	if metadataEndpoint, ok := data.GetOk("metadata_endpoint"); ok {
-		config.MetadataEndpoint = metadataEndpoint.(string)
 	}
 
 	if iamClientTimeout, ok := data.GetOk("iam_client_timeout"); ok {
@@ -199,9 +186,6 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, dat
 	// Set defaults if not provided
 	if config.IAMEndpoint == "" {
 		config.IAMEndpoint = defaultIAMEndpoint
-	}
-	if config.MetadataEndpoint == "" {
-		config.MetadataEndpoint = defaultMetadataEndpoint
 	}
 	if config.IAMClientTimeout == 0 {
 		config.IAMClientTimeout = 30
@@ -265,9 +249,6 @@ Configuration Parameters:
   * iam_endpoint (string, optional)
       IBM Cloud IAM endpoint URL. Defaults to https://iam.cloud.ibm.com
 
-  * metadata_endpoint (string, optional)
-      VPC metadata service endpoint URL. Defaults to http://169.254.169.254
-
   * iam_client_timeout (int, optional)
       Timeout for IAM API calls in seconds. Defaults to 30
 
@@ -286,8 +267,7 @@ Configuration Parameters:
 Example (minimal configuration):
 
   $ vault write auth/ibmcloud/config \
-      iam_endpoint="https://iam.cloud.ibm.com" \
-      metadata_endpoint="http://169.254.169.254"
+      iam_endpoint="https://iam.cloud.ibm.com"
 
 Example (with admin credentials for verification):
 

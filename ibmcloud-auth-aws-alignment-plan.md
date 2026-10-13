@@ -80,7 +80,7 @@
   - `builtin/credential/ibmcloud/path_role.go` (role `type`, `BoundTrustedProfileID`, `matchesIdentity`)
   - AWS reference: `builtin/credential/aws/path_login.go` for how the login path validates inputs up front and rejects partial or conflicting values.
   - IBM endpoints: `https://iam.cloud.ibm.com/identity/keys`, `/identity/introspect`, OIDC discovery at `/identity/.well-known/openid-configuration`.
-- **Status:** [ ] pending
+- **Status:** [x] done (formal tests are sub-task 5; `cli.go` and the agent method still use the old contract until sub-task 4)
 
 ---
 

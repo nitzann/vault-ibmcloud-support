@@ -16,9 +16,8 @@ import (
 const (
 	operationPrefixIBMCloud = "ibmcloud"
 
-	// Default endpoints
-	defaultIAMEndpoint      = "https://iam.cloud.ibm.com"
-	defaultMetadataEndpoint = "http://169.254.169.254"
+	// Default IAM endpoint
+	defaultIAMEndpoint = "https://iam.cloud.ibm.com"
 )
 
 // Factory creates a new backend implementing the logical.Backend interface
@@ -185,19 +184,13 @@ func (b *backend) getIAMClient(ctx context.Context, s logical.Storage) (*IBMClou
 
 	// Use defaults if not configured
 	iamEndpoint := defaultIAMEndpoint
-	metadataEndpoint := defaultMetadataEndpoint
 
-	if config != nil {
-		if config.IAMEndpoint != "" {
-			iamEndpoint = config.IAMEndpoint
-		}
-		if config.MetadataEndpoint != "" {
-			metadataEndpoint = config.MetadataEndpoint
-		}
+	if config != nil && config.IAMEndpoint != "" {
+		iamEndpoint = config.IAMEndpoint
 	}
 
 	// Create new client
-	client, err := NewIBMCloudIAMClient(iamEndpoint, metadataEndpoint, b.Logger())
+	client, err := NewIBMCloudIAMClient(iamEndpoint, b.Logger())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create IBM Cloud IAM client: %w", err)
 	}
@@ -207,23 +200,24 @@ func (b *backend) getIAMClient(ctx context.Context, s logical.Storage) (*IBMClou
 }
 
 const backendHelp = `
-The IBM Cloud auth method allows authentication using IBM Cloud IAM credentials.
+The IBM Cloud auth method allows authentication using an IBM Cloud IAM access
+token (JWT). Clients exchange their credential with IBM Cloud IAM themselves
+and send only the resulting token to Vault. The token is verified offline
+against the IAM JWKS and online via IAM introspect.
 
-It supports two authentication types:
+Roles have one of two types, which must match the identity kind in the token
+(the sub_type claim):
 
-1. API Key Authentication:
-   - Uses IBM Cloud API keys (user or service ID)
+1. apikey (User and ServiceId identities):
    - Validates against account ID, service ID, or user ID bindings
 
-2. Trusted Profile Authentication:
-   - Uses compute resource tokens from VPC instances
+2. trusted_profile (Profile identities, e.g. VPC instances):
    - Validates against trusted profile ID and compute resource CRN patterns
 
 Configuration:
   Configure the backend with IBM Cloud endpoints:
-    $ vault write auth/ibmcloud/config/ibmcloud \
-        iam_endpoint="https://iam.cloud.ibm.com" \
-        metadata_endpoint="http://169.254.169.254"
+    $ vault write auth/ibmcloud/config \
+        iam_endpoint="https://iam.cloud.ibm.com"
 
 Roles:
   Create roles that define authentication requirements:
@@ -236,8 +230,7 @@ Authentication:
   Authenticate using the login endpoint:
     $ vault write auth/ibmcloud/login \
         role=my-role \
-        type=apikey \
-        apikey="your-api-key"
+        token="<iam-access-token>"
 `
 
 // Made with Bob

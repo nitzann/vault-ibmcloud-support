@@ -18,24 +18,25 @@ import (
 
 // IBMCloudIAMClient wraps the IBM Cloud IAM API client
 type IBMCloudIAMClient struct {
-	iamEndpoint      string
-	metadataEndpoint string
-	httpClient       *http.Client
-	logger           hclog.Logger
+	iamEndpoint string
+	httpClient  *http.Client
+	logger      hclog.Logger
+	jwks        *jwksVerifier
 }
 
 // NewIBMCloudIAMClient creates a new IBM Cloud IAM client
-func NewIBMCloudIAMClient(iamEndpoint, metadataEndpoint string, logger hclog.Logger) (*IBMCloudIAMClient, error) {
+func NewIBMCloudIAMClient(iamEndpoint string, logger hclog.Logger) (*IBMCloudIAMClient, error) {
 	if logger == nil {
 		logger = hclog.NewNullLogger()
 	}
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 	return &IBMCloudIAMClient{
-		iamEndpoint:      iamEndpoint,
-		metadataEndpoint: metadataEndpoint,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-		logger: logger,
+		iamEndpoint: iamEndpoint,
+		httpClient:  httpClient,
+		logger:      logger,
+		jwks:        newJWKSVerifier(iamEndpoint, httpClient),
 	}, nil
 }
 
@@ -51,6 +52,7 @@ type IAMTokenResponse struct {
 
 // IdentityInfo represents identity information extracted from IAM token
 type IdentityInfo struct {
+	Active            bool     `json:"active"`
 	AccountID         string   `json:"account_id"`
 	IAMID             string   `json:"iam_id"`
 	Subject           string   `json:"sub"`
@@ -83,8 +85,6 @@ func (c *IBMCloudIAMClient) AuthenticateWithAPIKey(ctx context.Context, apiKey s
 	data := url.Values{}
 	data.Set("grant_type", "urn:ibm:params:oauth:grant-type:apikey")
 	data.Set("apikey", apiKey)
-
-	c.logger.Debug("request payload", "grant_type", "urn:ibm:params:oauth:grant-type:apikey", "apikey", apiKey[:min(10, len(apiKey))]+"...")
 
 	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, strings.NewReader(data.Encode()))
 	if err != nil {
@@ -121,7 +121,9 @@ func (c *IBMCloudIAMClient) AuthenticateWithAPIKey(ctx context.Context, apiKey s
 	return &tokenResp, nil
 }
 
-// AuthenticateWithCRToken exchanges a compute resource token for an IAM token
+// AuthenticateWithCRToken exchanges a compute resource token for an IAM token.
+// The server login path no longer calls it; it is kept for the client-side
+// exchange in the CLI handler and Agent (plan sub-task 4).
 func (c *IBMCloudIAMClient) AuthenticateWithCRToken(ctx context.Context, crToken, trustedProfileID string) (*IAMTokenResponse, error) {
 	data := url.Values{}
 	data.Set("grant_type", "urn:ibm:params:oauth:grant-type:cr-token")
@@ -158,46 +160,24 @@ func (c *IBMCloudIAMClient) AuthenticateWithCRToken(ctx context.Context, crToken
 	return &tokenResp, nil
 }
 
-// FetchCRToken retrieves a compute resource token from the VPC metadata service
-func (c *IBMCloudIAMClient) FetchCRToken(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "PUT", c.metadataEndpoint+"/identity/v1/token?version=2025-08-26", nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
+// VerifyToken verifies an IAM JWT offline against the IAM JWKS (signature,
+// issuer, exp, nbf) and then online via IAM introspect (active flag and
+// identity claims). Failures caused by the token itself wrap errInvalidToken.
+func (c *IBMCloudIAMClient) VerifyToken(ctx context.Context, token string) (*IdentityInfo, error) {
+	if err := c.jwks.verify(ctx, token); err != nil {
+		return nil, err
 	}
-
-	req.Header.Set("Metadata-Flavor", "ibm")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch CR token: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// The VPC metadata service returns 201 Created for PUT /identity/v1/token.
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to fetch CR token with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var result struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("failed to decode CR token response: %w", err)
-	}
-
-	return result.AccessToken, nil
+	return c.ValidateToken(ctx, token)
 }
 
-// ValidateToken validates an IAM token and returns identity information
+// ValidateToken introspects an IAM token and returns identity information.
+// It returns an error wrapping errInvalidToken if IAM reports the token as inactive.
 func (c *IBMCloudIAMClient) ValidateToken(ctx context.Context, token string) (*IdentityInfo, error) {
 	apiURL := c.iamEndpoint + "/identity/introspect"
 	c.logger.Debug("IBM Cloud IAM API call", "method", "POST", "url", apiURL, "endpoint", "introspect")
 
 	data := url.Values{}
 	data.Set("token", token)
-
-	c.logger.Debug("request payload", "token", token[:min(20, len(token))]+"...")
 
 	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, strings.NewReader(data.Encode()))
 	if err != nil {
@@ -221,6 +201,11 @@ func (c *IBMCloudIAMClient) ValidateToken(ctx context.Context, token string) (*I
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		c.logger.Error("IAM API error response", "status_code", resp.StatusCode, "body", string(body))
+		// IAM rejects tokens it considers invalid with 400/401; those are the
+		// caller's problem, not an IAM outage.
+		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized {
+			return nil, fmt.Errorf("%w: introspect rejected token with status %d", errInvalidToken, resp.StatusCode)
+		}
 		return nil, fmt.Errorf("token validation failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -229,11 +214,13 @@ func (c *IBMCloudIAMClient) ValidateToken(ctx context.Context, token string) (*I
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	c.logger.Debug("introspect response body", "body", string(body))
-
 	var info IdentityInfo
 	if err := json.Unmarshal(body, &info); err != nil {
 		return nil, fmt.Errorf("failed to decode identity info: %w", err)
+	}
+
+	if !info.Active {
+		return nil, fmt.Errorf("%w: token is not active", errInvalidToken)
 	}
 
 	// IBM Cloud IAM returns account in nested structure: account.bss
@@ -373,8 +360,6 @@ func (c *IBMCloudIAMClient) GetServiceID(ctx context.Context, adminToken, servic
 
 	req.Header.Set("Authorization", "Bearer "+adminToken)
 	req.Header.Set("Accept", "application/json")
-
-	c.logger.Debug("request headers", "Authorization", "Bearer "+adminToken[:min(20, len(adminToken))]+"...", "Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

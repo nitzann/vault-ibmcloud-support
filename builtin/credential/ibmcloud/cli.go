@@ -4,6 +4,7 @@
 package ibmcloud
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -14,7 +15,9 @@ import (
 // CLIHandler implements the Vault CLI auth handler interface
 type CLIHandler struct{}
 
-// Auth authenticates to Vault using IBM Cloud credentials
+// Auth authenticates to Vault using IBM Cloud credentials. The credential is
+// exchanged with IBM Cloud IAM locally; only the resulting IAM access token is
+// sent to Vault.
 func (h *CLIHandler) Auth(c *api.Client, m map[string]string) (*api.Secret, error) {
 	mount, ok := m["mount"]
 	if !ok {
@@ -26,46 +29,14 @@ func (h *CLIHandler) Auth(c *api.Client, m map[string]string) (*api.Secret, erro
 		return nil, fmt.Errorf("'role' must be specified")
 	}
 
-	authType, ok := m["type"]
-	if !ok {
-		return nil, fmt.Errorf("'type' must be specified (apikey or trusted_profile)")
+	token, err := resolveToken(m)
+	if err != nil {
+		return nil, err
 	}
 
-	// Validate auth type
-	if authType != "apikey" && authType != "trusted_profile" {
-		return nil, fmt.Errorf("'type' must be 'apikey' or 'trusted_profile'")
-	}
-
-	// Build login data
 	data := map[string]interface{}{
-		"role": role,
-		"type": authType,
-	}
-
-	// Handle API key authentication
-	if authType == "apikey" {
-		apiKey, ok := m["apikey"]
-		if !ok {
-			// Try to get from environment variable
-			apiKey = os.Getenv("IBMCLOUD_API_KEY")
-			if apiKey == "" {
-				return nil, fmt.Errorf("'apikey' must be specified or set in IBMCLOUD_API_KEY environment variable")
-			}
-		}
-		data["apikey"] = apiKey
-	}
-
-	// Handle trusted profile authentication
-	if authType == "trusted_profile" {
-		// CR token is optional - will be auto-fetched if not provided
-		if crToken, ok := m["cr_token"]; ok {
-			data["cr_token"] = crToken
-		}
-
-		// Trusted profile ID is optional
-		if trustedProfileID, ok := m["trusted_profile_id"]; ok {
-			data["trusted_profile_id"] = trustedProfileID
-		}
+		"role":  role,
+		"token": token,
 	}
 
 	path := fmt.Sprintf("auth/%s/login", mount)
@@ -81,36 +52,74 @@ func (h *CLIHandler) Auth(c *api.Client, m map[string]string) (*api.Secret, erro
 	return secret, nil
 }
 
+// resolveToken returns the IAM access token to send to Vault, exchanging an
+// API key or a compute resource token with IAM when no token is supplied.
+func resolveToken(m map[string]string) (string, error) {
+	if token := m["token"]; token != "" {
+		return token, nil
+	}
+
+	iamEndpoint := m["iam_endpoint"]
+	if iamEndpoint == "" {
+		iamEndpoint = defaultIAMEndpoint
+	}
+
+	client, err := NewIBMCloudIAMClient(iamEndpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	ctx := context.Background()
+
+	if crToken := m["cr_token"]; crToken != "" {
+		resp, err := client.AuthenticateWithCRToken(ctx, crToken, m["trusted_profile_id"])
+		if err != nil {
+			return "", fmt.Errorf("failed to exchange CR token: %w", err)
+		}
+		return resp.AccessToken, nil
+	}
+
+	apiKey := m["apikey"]
+	if apiKey == "" {
+		apiKey = os.Getenv("IBMCLOUD_API_KEY")
+	}
+	if apiKey == "" {
+		return "", fmt.Errorf("one of 'token', 'apikey' (or IBMCLOUD_API_KEY) or 'cr_token' must be specified")
+	}
+
+	resp, err := client.AuthenticateWithAPIKey(ctx, apiKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to exchange API key: %w", err)
+	}
+	return resp.AccessToken, nil
+}
+
 // Help returns the help text for the IBM Cloud auth method
 func (h *CLIHandler) Help() string {
 	help := `
 Usage: vault login -method=ibmcloud [CONFIG K=V...]
 
-  The IBM Cloud auth method allows users to authenticate with IBM Cloud
-  IAM credentials. It supports two authentication types:
+  The IBM Cloud auth method authenticates with an IBM Cloud IAM access token.
+  The CLI can obtain the token for you from an API key or a compute resource
+  token. Only the resulting IAM access token is sent to Vault.
 
-  1. API Key Authentication - Using IBM Cloud API keys
-  2. Trusted Profile Authentication - Using compute resource tokens
-
-  Authenticate using an API key:
+  Authenticate using an existing IAM access token:
 
       $ vault login -method=ibmcloud \
           role=my-role \
-          type=apikey \
+          token=your-iam-access-token
+
+  Authenticate using an API key (user or service ID):
+
+      $ vault login -method=ibmcloud \
+          role=my-role \
           apikey=your-api-key
 
-  Authenticate using a trusted profile (auto-fetch CR token):
+  Authenticate using a compute resource token and a trusted profile:
 
       $ vault login -method=ibmcloud \
           role=my-role \
-          type=trusted_profile
-
-  Authenticate using a trusted profile (explicit CR token):
-
-      $ vault login -method=ibmcloud \
-          role=my-role \
-          type=trusted_profile \
-          cr_token=your-cr-token
+          cr_token=your-cr-token \
+          trusted_profile_id=Profile-xxxx
 
 Configuration:
 
@@ -123,19 +132,25 @@ Configuration:
   role=<string>
       Name of the role to authenticate against. This is required.
 
-  type=<string>
-      Type of authentication: "apikey" or "trusted_profile". This is required.
+  token=<string>
+      IBM Cloud IAM access token, used as is.
 
   apikey=<string>
-      (API Key type) IBM Cloud API key. Can also be specified via the
-      IBMCLOUD_API_KEY environment variable.
+      IBM Cloud API key to exchange for an IAM access token. Can also be
+      specified via the IBMCLOUD_API_KEY environment variable.
 
   cr_token=<string>
-      (Trusted Profile type) Compute resource token. If not provided, it will
-      be automatically fetched from the VPC metadata service.
+      Compute resource token to exchange for an IAM access token. Requires
+      trusted_profile_id.
 
   trusted_profile_id=<string>
-      (Trusted Profile type) Trusted profile ID to use. Optional.
+      Trusted profile ID used with cr_token.
+
+  iam_endpoint=<string>
+      IBM Cloud IAM endpoint used for the exchange. The default value is
+      "https://iam.cloud.ibm.com".
+
+  One of token, apikey (or IBMCLOUD_API_KEY) or cr_token is required.
 `
 
 	return strings.TrimSpace(help)
