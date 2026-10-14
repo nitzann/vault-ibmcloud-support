@@ -79,6 +79,12 @@ func Backend(conf *logical.BackendConfig) (*backend, error) {
 		Invalidate:  b.invalidate,
 		BackendType: logical.TypeCredential,
 		Clean:       b.cleanup,
+		RotateCredential: func(ctx context.Context, req *logical.Request) error {
+			b.configMutex.Lock()
+			defer b.configMutex.Unlock()
+			_, err := b.rotateRoot(ctx, req)
+			return err
+		},
 	}
 
 	return b, nil
@@ -162,7 +168,8 @@ func (b *backend) getAdminToken(ctx context.Context, s logical.Storage) (string,
 	return b.adminToken, nil
 }
 
-// getIAMClient returns a configured IBM Cloud IAM client
+// getIAMClient returns a configured IBM Cloud IAM client.
+// It acquires configMutex internally; callers must NOT hold configMutex.
 func (b *backend) getIAMClient(ctx context.Context, s logical.Storage) (*IBMCloudIAMClient, error) {
 	b.configMutex.RLock()
 	if b.iamClient != nil {
@@ -175,6 +182,16 @@ func (b *backend) getIAMClient(ctx context.Context, s logical.Storage) (*IBMClou
 	defer b.configMutex.Unlock()
 
 	// Check again in case another goroutine created it
+	if b.iamClient != nil {
+		return b.iamClient, nil
+	}
+
+	return b.getIAMClientLocked(ctx, s)
+}
+
+// getIAMClientLocked creates (or returns the cached) IAM client.
+// The caller MUST already hold b.configMutex (write lock).
+func (b *backend) getIAMClientLocked(ctx context.Context, s logical.Storage) (*IBMCloudIAMClient, error) {
 	if b.iamClient != nil {
 		return b.iamClient, nil
 	}

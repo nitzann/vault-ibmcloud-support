@@ -128,7 +128,7 @@
   - `builtin/credential/aws/backend.go` (RotateCredential callback)
   - `github.com/hashicorp/vault/sdk/helper/automatedrotationutil` — already a direct dependency
   - `github.com/hashicorp/vault/sdk/rotation` — already a direct dependency
-- **Status:** [ ] pending
+- **Status:** [x] done
 
 ---
 

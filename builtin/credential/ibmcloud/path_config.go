@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/automatedrotationutil"
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
@@ -34,10 +35,14 @@ type ibmCloudConfig struct {
 	// IBM Cloud account ID for authentication verification (required when api_key is set)
 	// Used to verify that authenticating users/service IDs belong to this account
 	AccountID string `json:"account_id"`
+
+	// AutomatedRotationParams holds the schedule/period/window/disable fields
+	// for automated root credential rotation.
+	automatedrotationutil.AutomatedRotationParams
 }
 
 func (b *backend) pathConfigIBMCloud() *framework.Path {
-	return &framework.Path{
+	p := &framework.Path{
 		Pattern: "config$",
 
 		DisplayAttrs: &framework.DisplayAttributes{
@@ -145,6 +150,8 @@ func (b *backend) pathConfigIBMCloud() *framework.Path {
 		HelpSynopsis:    pathConfigHelpSyn,
 		HelpDescription: pathConfigHelpDesc,
 	}
+	automatedrotationutil.AddAutomatedRotationFields(p.Fields)
+	return p
 }
 
 // pathConfigExistenceCheck checks if configuration exists
@@ -167,15 +174,16 @@ func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, data
 		return nil, nil
 	}
 
-	return &logical.Response{
-		Data: map[string]interface{}{
-			"iam_endpoint":       config.IAMEndpoint,
-			"iam_client_timeout": config.IAMClientTimeout,
-			"service_id":         config.ServiceID,
-			"account_id":         config.AccountID,
-			// Never return the API key
-		},
-	}, nil
+	respData := map[string]interface{}{
+		"iam_endpoint":       config.IAMEndpoint,
+		"iam_client_timeout": config.IAMClientTimeout,
+		"service_id":         config.ServiceID,
+		"account_id":         config.AccountID,
+		// Never return the API key
+	}
+	config.AutomatedRotationParams.PopulateSetAutomatedRotationData(respData)
+
+	return &logical.Response{Data: respData}, nil
 }
 
 func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
@@ -232,13 +240,22 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, dat
 		config.IAMClientTimeout = 30
 	}
 
+	// Handle automated rotation fields. HandleRotationJob calls
+	// ParseAutomatedRotationFields internally and decides whether to
+	// register or deregister based on the parsed values; calling it
+	// unconditionally is correct and avoids a redundant pre-parse.
+	rotationOpResp, err := config.HandleRotationJob(ctx, b.Backend, data, req)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+
 	entry, err := logical.StorageEntryJSON(configStoragePath, config)
 	if err != nil {
-		return nil, err
+		return nil, rotationOpResp.HandleStorageErrorAfterRotationJob(req, err)
 	}
 
 	if err := req.Storage.Put(ctx, entry); err != nil {
-		return nil, err
+		return nil, rotationOpResp.HandleStorageErrorAfterRotationJob(req, err)
 	}
 
 	// Invalidate the cached client

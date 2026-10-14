@@ -63,7 +63,13 @@ func (b *backend) pathConfigRotateRoot() *framework.Path {
 func (b *backend) pathConfigRotateRootUpdate(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 	b.configMutex.Lock()
 	defer b.configMutex.Unlock()
+	return b.rotateRoot(ctx, req)
+}
 
+// rotateRoot performs the actual root credential rotation. It is called both by
+// the manual config/rotate-root endpoint and by the RotateCredential callback
+// for automated rotation. The caller must hold b.configMutex.
+func (b *backend) rotateRoot(ctx context.Context, req *logical.Request) (*logical.Response, error) {
 	// Load current configuration
 	config, err := b.config(ctx, req.Storage)
 	if err != nil {
@@ -78,8 +84,10 @@ func (b *backend) pathConfigRotateRootUpdate(ctx context.Context, req *logical.R
 		return logical.ErrorResponse("api_key and service_id must be configured before rotating credentials"), nil
 	}
 
-	// Get IAM client
-	client, err := b.getIAMClient(ctx, req.Storage)
+	// Get IAM client. rotateRoot is always called with b.configMutex held, so
+	// we must use the lock-free variant to avoid a deadlock (sync.RWMutex is
+	// not reentrant).
+	client, err := b.getIAMClientLocked(ctx, req.Storage)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get IAM client: %w", err)
 	}
@@ -160,7 +168,8 @@ func (b *backend) pathConfigRotateRootUpdate(ctx context.Context, req *logical.R
 		}
 	}
 
-	// Step 6: Clear cached IAM client to force recreation with new credentials
+	// Step 6: Clear cached IAM client to force recreation with new credentials.
+	// Safe to write directly: all callers hold b.configMutex (write lock).
 	b.iamClient = nil
 
 	return &logical.Response{
