@@ -104,7 +104,7 @@
   - `builtin/credential/ibmcloud/path_config_rotate_root.go`
   - `builtin/credential/ibmcloud/backend.go`
   - AWS reference: `builtin/credential/aws/path_config_client.go` (forwarding flags, `Summary`, `Responses`) and `builtin/credential/aws/path_config_rotate_root.go`.
-- **Status:** [ ] pending
+- **Status:** [x] done
 
 ---
 
@@ -157,7 +157,7 @@
   - `builtin/credential/ibmcloud/client.go` (existing exported IAM client with `AuthenticateWithAPIKey`, `AuthenticateWithCRToken`, `FetchCRToken`)
   - AWS reference: `builtin/credential/aws/cli.go` (client resolves credentials itself then writes login data) and `command/client/auth/aws`. AWS shares logic through `internal/awsutil/v2`.
   - `command/server/commands_full.go` (CLI handler registration)
-- **Status:** [ ] pending
+- **Status:** [x] done
 
 ---
 
@@ -240,7 +240,7 @@ vault auth enable -path=cloud ibmcloud
 
 ### Step 2 — Configure the backend
 
-The configuration tells Vault where to reach IBM Cloud IAM and provides an admin credential for account and access group verification.
+The configuration tells Vault where to reach IBM Cloud IAM and provides an admin credential for account membership verification and root credential rotation.
 
 ```bash
 vault write auth/ibmcloud/config \
@@ -259,6 +259,55 @@ vault write auth/ibmcloud/config \
 | `service_id` | Yes when `api_key` is set | Service ID that owns the API key. Required for root rotation. |
 | `account_id` | Yes when `api_key` is set | IBM Cloud account ID that authenticating identities must belong to. |
 | `iam_client_timeout` | No | IAM API call timeout in seconds. Defaults to 30. |
+
+#### What are the admin credentials and what IAM access is required?
+
+The admin credential (`api_key` and `service_id`) belongs to a dedicated IBM Cloud **Service ID** in your IBM Cloud account. Vault uses this credential in the background to obtain an IAM admin token for two distinct tasks:
+
+1. **Account Membership Verification (during API key / user logins):**
+   - **Service ID verification:** Calls the IAM Identity Service (`GET /v1/serviceids/{id}`) to verify that an authenticating Service ID belongs to the configured account.
+   - **User verification:** Calls the IAM User Management Service (`GET /v2/accounts/{account_id}/users/{user_id}`) to verify that an authenticating user has active access to the account.
+2. **Root Credential Rotation (`config/rotate-root`):**
+   - Calls the IAM Identity API (`POST /v1/apikeys`, `GET /v1/apikeys/{id}`, `DELETE /v1/apikeys/{id}`) to create a replacement API key for the Service ID and remove the old key.
+
+#### Required IAM Policies for the Service ID
+
+Assign the following minimum IAM access roles to the Service ID:
+
+| Service | Required Role | Why it is needed |
+|---|---|---|
+| **IAM Identity Service** (`iam-identity`) | **`Operator`** (or `Administrator`) | Allows creating, reading, and deleting API keys on the Service ID for root rotation (`POST/GET/DELETE /v1/apikeys`), as well as looking up Service IDs (`GET /v1/serviceids/{id}`) for login account validation. |
+| **User Management Service** (`user-management`) | **`Viewer`** (or higher) | Allows inspecting user membership in the account (`GET /v2/accounts/{account_id}/users/{user_id}`) during user login verification. |
+
+#### Example: Setting up the Service ID and Policies via IBM Cloud CLI
+
+```bash
+# 1. Create a dedicated Service ID for Vault
+SERVICE_ID_JSON=$(ibmcloud iam service-id-create vault-ibmcloud-auth-admin \
+    --description "Admin Service ID for Vault IBM Cloud auth method" --output json)
+SERVICE_ID=$(echo "${SERVICE_ID_JSON}" | jq -r .id)
+
+# 2. Grant Operator role on IAM Identity Service (for API key management & service ID lookups)
+ibmcloud iam service-policy-create "${SERVICE_ID}" \
+    --roles Operator \
+    --service-name iam-identity
+
+# 3. Grant Viewer role on User Management Service (for user account membership verification)
+ibmcloud iam service-policy-create "${SERVICE_ID}" \
+    --roles Viewer \
+    --service-name user-management
+
+# 4. Generate the initial admin API key for Vault
+API_KEY_JSON=$(ibmcloud iam service-api-key-create vault-auth-admin-key "${SERVICE_ID}" \
+    --description "Initial admin API key for Vault auth backend" --output json)
+ADMIN_API_KEY=$(echo "${API_KEY_JSON}" | jq -r .apikey)
+
+# 5. Write the configuration to Vault
+vault write auth/ibmcloud/config \
+    api_key="${ADMIN_API_KEY}" \
+    service_id="${SERVICE_ID}" \
+    account_id="$(ibmcloud target --output json | jq -r .account.guid)"
+```
 
 To read the current configuration (the `api_key` is never returned):
 
@@ -476,6 +525,216 @@ auto_auth {
     }
   }
 }
+```
+
+---
+
+### Step 5 — Demo: Access Groups Enforcement & Cross-Role Secrets Isolation
+
+This complete walkthrough demonstrates:
+1. **IBM Cloud Access Group Enforcement (`bound_access_group_ids`)**: An authenticating Service ID cannot log into a role requiring an Access Group until it is explicitly added to that group in IBM Cloud.
+2. **Role-Based Secrets Isolation**: Secrets created by one role (e.g. `dev-role` with `dev-policy`) cannot be read by another Service ID authenticating with a different role (e.g. `billing-role` with `billing-policy`).
+
+```mermaid
+flowchart TD
+    subgraph IBM_Cloud["IBM Cloud IAM"]
+        AG_DEV["Access Group: vault-demo-devs<br/>(AccessGroupId-1111)"]
+        AG_BILL["Access Group: vault-demo-billing<br/>(AccessGroupId-2222)"]
+        SVC_DEV["Service ID: vault-dev-app"] --> AG_DEV
+        SVC_BILL["Service ID: vault-billing-app"] --> AG_BILL
+    end
+
+    subgraph Vault["Vault Server"]
+        ROLE_DEV["Role: dev-restricted-role<br/>(bound to AccessGroupId-1111)"] --> POL_DEV["Policy: dev-policy"]
+        ROLE_BILL["Role: billing-restricted-role<br/>(bound to AccessGroupId-2222)"] --> POL_BILL["Policy: billing-policy"]
+        
+        POL_DEV -->|"Read/Write"| SEC_DEV["secret/data/dev/*"]
+        POL_BILL -->|"Read/Write"| SEC_BILL["secret/data/billing/*"]
+        POL_BILL -.->|"❌ DENIED"| SEC_DEV
+    end
+
+    SVC_DEV -->|"vault login"| ROLE_DEV
+    SVC_BILL -->|"vault login"| ROLE_BILL
+```
+
+---
+
+#### 1. Setup IBM Cloud Access Groups & Service IDs
+
+```bash
+ACCOUNT_ID=$(ibmcloud target --output json | jq -r .account.guid)
+
+# 1. Create two IBM Cloud Access Groups
+DEV_GROUP_JSON=$(ibmcloud iam access-group-create vault-demo-devs \
+    --description "Developers group for Vault demo" --output json)
+DEV_GROUP_ID=$(echo "${DEV_GROUP_JSON}" | jq -r .id)
+
+BILLING_GROUP_JSON=$(ibmcloud iam access-group-create vault-demo-billing \
+    --description "Billing group for Vault demo" --output json)
+BILLING_GROUP_ID=$(echo "${BILLING_GROUP_JSON}" | jq -r .id)
+
+# 2. Create Dev Service ID & API key
+DEV_SVC_JSON=$(ibmcloud iam service-id-create vault-dev-app \
+    --description "Dev application Service ID" --output json)
+DEV_SVC_ID=$(echo "${DEV_SVC_JSON}" | jq -r .id)
+
+DEV_KEY_JSON=$(ibmcloud iam service-api-key-create dev-app-key "${DEV_SVC_ID}" \
+    --description "Dev app API key" --output json)
+DEV_API_KEY=$(echo "${DEV_KEY_JSON}" | jq -r .apikey)
+
+# 3. Create Billing Service ID & API key
+BILLING_SVC_JSON=$(ibmcloud iam service-id-create vault-billing-app \
+    --description "Billing application Service ID" --output json)
+BILLING_SVC_ID=$(echo "${BILLING_SVC_JSON}" | jq -r .id)
+
+BILLING_KEY_JSON=$(ibmcloud iam service-api-key-create billing-app-key "${BILLING_SVC_ID}" \
+    --description "Billing app API key" --output json)
+BILLING_API_KEY=$(echo "${BILLING_KEY_JSON}" | jq -r .apikey)
+```
+
+---
+
+#### 2. Configure Vault ACL Policies & Secret Engine
+
+Enable KV-v2 and create isolated policies:
+
+```bash
+# Enable KV-v2 secrets engine at secret/
+vault secrets enable -path=secret kv-v2
+
+# Policy for dev team: full access to secret/data/dev/* only
+vault policy write dev-policy - <<EOF
+path "secret/data/dev/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+path "secret/metadata/dev/*" {
+  capabilities = ["list", "read", "delete"]
+}
+EOF
+
+# Policy for billing team: full access to secret/data/billing/* only
+vault policy write billing-policy - <<EOF
+path "secret/data/billing/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+path "secret/metadata/billing/*" {
+  capabilities = ["list", "read", "delete"]
+}
+EOF
+```
+
+---
+
+#### 3. Create Vault Roles Binding to Access Groups
+
+```bash
+# Dev role requires membership in vault-demo-devs Access Group (DEV_GROUP_ID)
+vault write auth/ibmcloud/role/dev-restricted-role \
+    type=apikey \
+    bound_account_id="${ACCOUNT_ID}" \
+    bound_access_group_ids="${DEV_GROUP_ID}" \
+    token_policies="default,dev-policy" \
+    token_ttl=1h
+
+# Billing role requires membership in vault-demo-billing Access Group (BILLING_GROUP_ID)
+vault write auth/ibmcloud/role/billing-restricted-role \
+    type=apikey \
+    bound_account_id="${ACCOUNT_ID}" \
+    bound_access_group_ids="${BILLING_GROUP_ID}" \
+    token_policies="default,billing-policy" \
+    token_ttl=1h
+```
+
+---
+
+#### 4. Demo Step A: Access Group Enforcement (Negative Test)
+
+Try logging in with `DEV_API_KEY` before adding `vault-dev-app` to the access group:
+
+```bash
+vault login -method=ibmcloud \
+    role=dev-restricted-role \
+    type=apikey \
+    apikey="${DEV_API_KEY}"
+```
+
+**Result (Rejected):**
+```text
+Error logging in: Error making API request.
+URL: PUT http://127.0.0.1:8200/v1/auth/ibmcloud/login
+Code: 400. Errors:
+
+* user is not a member of required access groups
+```
+
+---
+
+#### 5. Demo Step B: Add Service IDs to Access Groups
+
+Use the exact IBM Cloud CLI syntax `access-group-service-id-add <GROUP_NAME> <SERVICE_ID>`:
+
+```bash
+# Add Dev Service ID to vault-demo-devs
+ibmcloud iam access-group-service-id-add vault-demo-devs "${DEV_SVC_ID}"
+
+# Add Billing Service ID to vault-demo-billing
+ibmcloud iam access-group-service-id-add vault-demo-billing "${BILLING_SVC_ID}"
+```
+
+---
+
+#### 6. Demo Step C: Dev Login & Write Restricted Secret
+
+Log in with `DEV_API_KEY` (now succeeds) and write a secret:
+
+```bash
+# 1. Login as Dev Service ID
+DEV_VAULT_TOKEN=$(vault login -method=ibmcloud \
+    role=dev-restricted-role \
+    type=apikey \
+    apikey="${DEV_API_KEY}" \
+    -token-only)
+
+# 2. Write Dev secret
+VAULT_TOKEN="${DEV_VAULT_TOKEN}" vault kv put secret/dev/db-credentials \
+    username="db_admin" \
+    password="SuperSecretDevPassword123"
+
+# 3. Read back the Dev secret (Succeeds)
+VAULT_TOKEN="${DEV_VAULT_TOKEN}" vault kv get secret/dev/db-credentials
+```
+
+---
+
+#### 7. Demo Step D: Cross-Role Isolation (Billing cannot access Dev secrets)
+
+Now log in with `BILLING_API_KEY` and verify access boundaries:
+
+```bash
+# 1. Login as Billing Service ID
+BILLING_VAULT_TOKEN=$(vault login -method=ibmcloud \
+    role=billing-restricted-role \
+    type=apikey \
+    apikey="${BILLING_API_KEY}" \
+    -token-only)
+
+# 2. Write Billing secret (Succeeds under secret/billing/*)
+VAULT_TOKEN="${BILLING_VAULT_TOKEN}" vault kv put secret/billing/stripe-api-key \
+    api_key="sk_live_billing_key_xyz"
+
+# 3. Attempt to read Dev secret using Billing token (FAILS - Permission Denied)
+VAULT_TOKEN="${BILLING_VAULT_TOKEN}" vault kv get secret/dev/db-credentials
+```
+
+**Result (Permission Denied):**
+```text
+Error reading secret/data/dev/db-credentials: Error making API request.
+
+URL: GET http://127.0.0.1:8200/v1/secret/data/dev/db-credentials
+Code: 403. Errors:
+
+* 1 error occurred:
+	* permission denied
 ```
 
 ---

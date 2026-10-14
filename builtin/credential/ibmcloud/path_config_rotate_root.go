@@ -6,6 +6,7 @@ package ibmcloud
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/hashicorp/vault/sdk/framework"
@@ -24,8 +25,32 @@ func (b *backend) pathConfigRotateRoot() *framework.Path {
 		Operations: map[logical.Operation]framework.OperationHandler{
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathConfigRotateRootUpdate,
+				Summary:  "Rotate the root API key used by Vault for IBM Cloud authentication.",
 				DisplayAttrs: &framework.DisplayAttributes{
 					OperationVerb: "rotate",
+				},
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: "OK",
+						Fields: map[string]*framework.FieldSchema{
+							"service_id": {
+								Type:        framework.TypeString,
+								Description: "Service ID that owns the rotated API key.",
+							},
+							"rotated_at": {
+								Type:        framework.TypeString,
+								Description: "Timestamp of rotation.",
+							},
+							"new_key_id": {
+								Type:        framework.TypeString,
+								Description: "Key ID of the newly created API key.",
+							},
+							"old_key_id": {
+								Type:        framework.TypeString,
+								Description: "Key ID of the previous API key (present if deletion required manual cleanup).",
+							},
+						},
+					}},
 				},
 			},
 		},

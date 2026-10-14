@@ -6,6 +6,7 @@ package ibmcloud
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -75,26 +76,66 @@ func (b *backend) pathConfigIBMCloud() *framework.Path {
 		Operations: map[logical.Operation]framework.OperationHandler{
 			logical.ReadOperation: &framework.PathOperation{
 				Callback: b.pathConfigRead,
+				Summary:  "Return the configured IBM Cloud settings.",
 				DisplayAttrs: &framework.DisplayAttributes{
 					OperationVerb: "read",
+				},
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: "OK",
+						Fields: map[string]*framework.FieldSchema{
+							"iam_endpoint": {
+								Type:        framework.TypeString,
+								Description: "IBM Cloud IAM endpoint URL.",
+							},
+							"iam_client_timeout": {
+								Type:        framework.TypeInt,
+								Description: "Timeout for IAM API calls in seconds.",
+							},
+							"service_id": {
+								Type:        framework.TypeString,
+								Description: "Service ID that owns the API key.",
+							},
+							"account_id": {
+								Type:        framework.TypeString,
+								Description: "IBM Cloud account ID for authentication verification.",
+							},
+						},
+					}},
 				},
 			},
 			logical.CreateOperation: &framework.PathOperation{
 				Callback: b.pathConfigWrite,
+				Summary:  "Configure IBM Cloud IAM settings and credentials used for authentication.",
 				DisplayAttrs: &framework.DisplayAttributes{
 					OperationVerb: "configure",
+				},
+				ForwardPerformanceSecondary: true,
+				ForwardPerformanceStandby:   true,
+				Responses: map[int][]framework.Response{
+					http.StatusNoContent: {{Description: "No Content"}},
 				},
 			},
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathConfigWrite,
+				Summary:  "Configure IBM Cloud IAM settings and credentials used for authentication.",
 				DisplayAttrs: &framework.DisplayAttributes{
 					OperationVerb: "configure",
+				},
+				ForwardPerformanceSecondary: true,
+				ForwardPerformanceStandby:   true,
+				Responses: map[int][]framework.Response{
+					http.StatusNoContent: {{Description: "No Content"}},
 				},
 			},
 			logical.DeleteOperation: &framework.PathOperation{
 				Callback: b.pathConfigDelete,
+				Summary:  "Delete the IBM Cloud configuration.",
 				DisplayAttrs: &framework.DisplayAttributes{
 					OperationVerb: "delete",
+				},
+				Responses: map[int][]framework.Response{
+					http.StatusNoContent: {{Description: "No Content"}},
 				},
 			},
 		},

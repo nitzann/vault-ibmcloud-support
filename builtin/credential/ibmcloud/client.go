@@ -4,6 +4,7 @@
 package ibmcloud
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -158,6 +159,113 @@ func (c *IBMCloudIAMClient) AuthenticateWithCRToken(ctx context.Context, crToken
 	}
 
 	return &tokenResp, nil
+}
+
+// ExchangeVPCMetadata fetches an identity access token from the VPC metadata
+// service (PUT /identity/v1/token) and exchanges it via the metadata service
+// IAM token endpoint (POST /identity/v1/iam_tokens) for an IAM access token.
+// If trustedProfileID is empty, the metadata service uses the default trusted
+// profile linked to the compute instance.
+func (c *IBMCloudIAMClient) ExchangeVPCMetadata(ctx context.Context, metadataEndpoint, trustedProfileID string) (*IAMTokenResponse, error) {
+	if metadataEndpoint == "" {
+		metadataEndpoint = defaultMetadataEndpoint
+	}
+	metadataEndpoint = strings.TrimRight(metadataEndpoint, "/")
+
+	// Step 1: PUT /identity/v1/token
+	tokenURL := fmt.Sprintf("%s/identity/v1/token?version=2022-03-01", metadataEndpoint)
+	tokenReqBody := map[string]interface{}{
+		"expires_in": 3600,
+	}
+	tokenReqJSON, err := json.Marshal(tokenReqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal metadata token request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, tokenURL, bytes.NewReader(tokenReqJSON))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create metadata token request: %w", err)
+	}
+	req.Header.Set("Metadata-Flavor", "ibm")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch metadata identity token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("metadata identity token request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var identityTokenResp struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&identityTokenResp); err != nil {
+		return nil, fmt.Errorf("failed to decode metadata identity token response: %w", err)
+	}
+	if identityTokenResp.AccessToken == "" {
+		return nil, fmt.Errorf("empty access_token received from metadata identity token endpoint")
+	}
+
+	// Step 2: POST /identity/v1/iam_tokens
+	iamTokensURL := fmt.Sprintf("%s/identity/v1/iam_tokens?version=2022-03-01", metadataEndpoint)
+	var iamReqBody []byte
+	if trustedProfileID != "" {
+		bodyObj := map[string]interface{}{
+			"trusted_profile": map[string]string{
+				"id": trustedProfileID,
+			},
+		}
+		iamReqBody, err = json.Marshal(bodyObj)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal metadata iam_tokens request: %w", err)
+		}
+	}
+
+	var iamReqReader io.Reader
+	if len(iamReqBody) > 0 {
+		iamReqReader = bytes.NewReader(iamReqBody)
+	} else {
+		iamReqReader = bytes.NewReader([]byte("{}"))
+	}
+
+	iamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, iamTokensURL, iamReqReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create metadata iam_tokens request: %w", err)
+	}
+	iamReq.Header.Set("Metadata-Flavor", "ibm")
+	iamReq.Header.Set("Authorization", "Bearer "+identityTokenResp.AccessToken)
+	iamReq.Header.Set("Content-Type", "application/json")
+	iamReq.Header.Set("Accept", "application/json")
+
+	iamResp, err := c.httpClient.Do(iamReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to exchange metadata token for IAM token: %w", err)
+	}
+	defer iamResp.Body.Close()
+
+	if iamResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(iamResp.Body)
+		if trustedProfileID == "" {
+			return nil, fmt.Errorf("metadata IAM token exchange failed with status %d: %s (if the instance does not have a default trusted profile, specify trusted_profile_id)", iamResp.StatusCode, string(body))
+		}
+		return nil, fmt.Errorf("metadata IAM token exchange failed with status %d: %s", iamResp.StatusCode, string(body))
+	}
+
+	var iamTokenResp IAMTokenResponse
+	if err := json.NewDecoder(iamResp.Body).Decode(&iamTokenResp); err != nil {
+		return nil, fmt.Errorf("failed to decode metadata IAM token response: %w", err)
+	}
+	if iamTokenResp.AccessToken == "" {
+		return nil, fmt.Errorf("empty access_token received from metadata IAM token endpoint")
+	}
+
+	return &iamTokenResp, nil
 }
 
 // VerifyToken verifies an IAM JWT offline against the IAM JWKS (signature,

@@ -18,6 +18,9 @@ const (
 
 	// Default IAM endpoint
 	defaultIAMEndpoint = "https://iam.cloud.ibm.com"
+
+	// Default metadata endpoint
+	defaultMetadataEndpoint = "http://169.254.169.254"
 )
 
 // Factory creates a new backend implementing the logical.Backend interface

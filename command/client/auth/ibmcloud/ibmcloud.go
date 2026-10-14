@@ -7,13 +7,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/api"
+	"github.com/hashicorp/vault/builtin/credential/ibmcloud"
 	"github.com/hashicorp/vault/command/client/auth"
 )
 
@@ -26,6 +27,9 @@ const (
 
 	// Default metadata endpoint
 	defaultMetadataEndpoint = "http://169.254.169.254"
+
+	// Default IAM endpoint
+	defaultIAMEndpoint = "https://iam.cloud.ibm.com"
 )
 
 type ibmcloudMethod struct {
@@ -36,20 +40,27 @@ type ibmcloudMethod struct {
 	// Mount path for the auth method
 	mountPath string
 
+	// Endpoints
+	iamEndpoint      string
+	metadataEndpoint string
+
 	// For API key type
 	apiKey string
 
 	// For trusted profile type
 	crToken                string
 	trustedProfileID       string
-	metadataEndpoint       string
 	credentialPollInterval int
 
 	// Credential refresh
-	credLock    sync.Mutex
-	lastCRToken string
-	credsFound  chan struct{}
-	stopCh      chan struct{}
+	credLock     sync.Mutex
+	lastIAMToken string
+	// credsFound is non-nil only when the metadata polling goroutine is
+	// running (i.e. typeTrustedProfile without a static cr_token).
+	// NewCreds() returns nil for all other cases so the auth handler
+	// framework substitutes an inert channel and never blocks.
+	credsFound chan struct{}
+	stopCh     chan struct{}
 }
 
 // NewIBMCloudAuthMethod creates a new IBM Cloud auth method for Vault Agent
@@ -64,25 +75,10 @@ func NewIBMCloudAuthMethod(conf *auth.AuthConfig) (auth.AuthMethod, error) {
 	a := &ibmcloudMethod{
 		logger:                 conf.Logger,
 		mountPath:              conf.MountPath,
-		credsFound:             make(chan struct{}),
 		stopCh:                 make(chan struct{}),
+		iamEndpoint:            defaultIAMEndpoint,
 		metadataEndpoint:       defaultMetadataEndpoint,
 		credentialPollInterval: defaultCredentialPollInterval,
-	}
-
-	// Get auth type
-	typeRaw, ok := conf.Config["type"]
-	if !ok {
-		return nil, errors.New("missing 'type' value")
-	}
-	a.authType, ok = typeRaw.(string)
-	if !ok {
-		return nil, errors.New("could not convert 'type' config value to string")
-	}
-
-	// Validate auth type
-	if a.authType != typeAPIKey && a.authType != typeTrustedProfile {
-		return nil, fmt.Errorf("'type' must be '%s' or '%s'", typeAPIKey, typeTrustedProfile)
 	}
 
 	// Get role
@@ -94,29 +90,69 @@ func NewIBMCloudAuthMethod(conf *auth.AuthConfig) (auth.AuthMethod, error) {
 	if !ok {
 		return nil, errors.New("could not convert 'role' config value to string")
 	}
-
 	if a.role == "" {
 		return nil, errors.New("'role' value is empty")
 	}
 
+	// Endpoints overrides (optional)
+	if iamEndpointRaw, ok := conf.Config["iam_endpoint"]; ok {
+		if iamEndpoint, ok := iamEndpointRaw.(string); ok && iamEndpoint != "" {
+			a.iamEndpoint = iamEndpoint
+		} else {
+			return nil, errors.New("could not convert 'iam_endpoint' config value to string")
+		}
+	}
+
+	if metadataEndpointRaw, ok := conf.Config["metadata_endpoint"]; ok {
+		if metadataEndpoint, ok := metadataEndpointRaw.(string); ok && metadataEndpoint != "" {
+			a.metadataEndpoint = metadataEndpoint
+		} else {
+			return nil, errors.New("could not convert 'metadata_endpoint' config value to string")
+		}
+	}
+
+	// Get auth type
+	if typeRaw, ok := conf.Config["type"]; ok {
+		a.authType, ok = typeRaw.(string)
+		if !ok {
+			return nil, errors.New("could not convert 'type' config value to string")
+		}
+	} else {
+		// Infer type if omitted
+		if _, ok := conf.Config["apikey"]; ok {
+			a.authType = typeAPIKey
+		} else if _, ok := conf.Config["cr_token"]; ok || conf.Config["trusted_profile_id"] != nil {
+			a.authType = typeTrustedProfile
+		} else if os.Getenv("IBMCLOUD_API_KEY") != "" {
+			a.authType = typeAPIKey
+		} else {
+			return nil, errors.New("missing 'type' value")
+		}
+	}
+
+	// Validate auth type
+	if a.authType != typeAPIKey && a.authType != typeTrustedProfile {
+		return nil, fmt.Errorf("'type' must be '%s' or '%s'", typeAPIKey, typeTrustedProfile)
+	}
+
 	// Handle API key type configuration
 	if a.authType == typeAPIKey {
-		apiKeyRaw, ok := conf.Config["apikey"]
-		if !ok {
-			return nil, errors.New("missing 'apikey' value for apikey type")
-		}
-		a.apiKey, ok = apiKeyRaw.(string)
-		if !ok {
-			return nil, errors.New("could not convert 'apikey' config value to string")
+		if apiKeyRaw, ok := conf.Config["apikey"]; ok {
+			a.apiKey, ok = apiKeyRaw.(string)
+			if !ok {
+				return nil, errors.New("could not convert 'apikey' config value to string")
+			}
 		}
 		if a.apiKey == "" {
-			return nil, errors.New("'apikey' value is empty")
+			a.apiKey = os.Getenv("IBMCLOUD_API_KEY")
+		}
+		if a.apiKey == "" {
+			return nil, errors.New("missing 'apikey' value for apikey type (or set IBMCLOUD_API_KEY)")
 		}
 	}
 
 	// Handle trusted profile type configuration
 	if a.authType == typeTrustedProfile {
-		// CR token is optional - will be auto-fetched if not provided
 		if crTokenRaw, ok := conf.Config["cr_token"]; ok {
 			a.crToken, ok = crTokenRaw.(string)
 			if !ok {
@@ -124,7 +160,6 @@ func NewIBMCloudAuthMethod(conf *auth.AuthConfig) (auth.AuthMethod, error) {
 			}
 		}
 
-		// Trusted profile ID is optional
 		if trustedProfileIDRaw, ok := conf.Config["trusted_profile_id"]; ok {
 			a.trustedProfileID, ok = trustedProfileIDRaw.(string)
 			if !ok {
@@ -132,15 +167,6 @@ func NewIBMCloudAuthMethod(conf *auth.AuthConfig) (auth.AuthMethod, error) {
 			}
 		}
 
-		// Metadata endpoint is optional
-		if metadataEndpointRaw, ok := conf.Config["metadata_endpoint"]; ok {
-			a.metadataEndpoint, ok = metadataEndpointRaw.(string)
-			if !ok {
-				return nil, errors.New("could not convert 'metadata_endpoint' config value to string")
-			}
-		}
-
-		// Credential poll interval is optional
 		if credentialPollIntervalRaw, ok := conf.Config["credential_poll_interval"]; ok {
 			if credentialPollInterval, ok := credentialPollIntervalRaw.(int); ok && credentialPollInterval > 0 {
 				a.credentialPollInterval = credentialPollInterval
@@ -149,19 +175,13 @@ func NewIBMCloudAuthMethod(conf *auth.AuthConfig) (auth.AuthMethod, error) {
 			}
 		}
 
-		// If no CR token provided, fetch it initially
+		// When using metadata service (no static cr_token), poll periodically
+		// to detect refreshed credentials. A non-nil credsFound tells the auth
+		// handler framework to re-authenticate when a new token arrives.
 		if a.crToken == "" {
-			crToken, err := a.fetchCRToken()
-			if err != nil {
-				return nil, fmt.Errorf("failed to fetch initial CR token: %w", err)
-			}
-			a.lastCRToken = crToken
-		} else {
-			a.lastCRToken = a.crToken
+			a.credsFound = make(chan struct{})
+			go a.pollForCredentials()
 		}
-
-		// Start polling for new CR tokens
-		go a.pollForCRToken()
 	}
 
 	return a, nil
@@ -171,22 +191,37 @@ func NewIBMCloudAuthMethod(conf *auth.AuthConfig) (auth.AuthMethod, error) {
 func (a *ibmcloudMethod) Authenticate(ctx context.Context, client *api.Client) (retPath string, header http.Header, retData map[string]interface{}, retErr error) {
 	a.logger.Trace("beginning authentication")
 
-	data := make(map[string]interface{})
-	data["role"] = a.role
-	data["type"] = a.authType
+	iamClient, err := ibmcloud.NewIBMCloudIAMClient(a.iamEndpoint, a.logger)
+	if err != nil {
+		retErr = fmt.Errorf("failed to create IAM client: %w", err)
+		return
+	}
 
+	var iamToken string
 	switch a.authType {
 	case typeAPIKey:
-		data["apikey"] = a.apiKey
+		resp, err := iamClient.AuthenticateWithAPIKey(ctx, a.apiKey)
+		if err != nil {
+			retErr = fmt.Errorf("failed to exchange API key: %w", err)
+			return
+		}
+		iamToken = resp.AccessToken
 
 	case typeTrustedProfile:
-		a.credLock.Lock()
-		crToken := a.lastCRToken
-		a.credLock.Unlock()
-
-		data["cr_token"] = crToken
-		if a.trustedProfileID != "" {
-			data["trusted_profile_id"] = a.trustedProfileID
+		if a.crToken != "" {
+			resp, err := iamClient.AuthenticateWithCRToken(ctx, a.crToken, a.trustedProfileID)
+			if err != nil {
+				retErr = fmt.Errorf("failed to exchange CR token: %w", err)
+				return
+			}
+			iamToken = resp.AccessToken
+		} else {
+			resp, err := iamClient.ExchangeVPCMetadata(ctx, a.metadataEndpoint, a.trustedProfileID)
+			if err != nil {
+				retErr = fmt.Errorf("failed to exchange VPC metadata token: %w", err)
+				return
+			}
+			iamToken = resp.AccessToken
 		}
 
 	default:
@@ -194,10 +229,21 @@ func (a *ibmcloudMethod) Authenticate(ctx context.Context, client *api.Client) (
 		return
 	}
 
+	a.credLock.Lock()
+	a.lastIAMToken = iamToken
+	a.credLock.Unlock()
+
+	data := map[string]interface{}{
+		"role":  a.role,
+		"token": iamToken,
+	}
+
 	return fmt.Sprintf("%s/login", a.mountPath), nil, data, nil
 }
 
-// NewCreds returns a channel that signals when new credentials are available
+// NewCreds returns a channel that signals when new credentials are available.
+// Returns nil when no polling goroutine is running (static cr_token or apikey),
+// which causes the auth handler framework to substitute an inert channel.
 func (a *ibmcloudMethod) NewCreds() chan struct{} {
 	return a.credsFound
 }
@@ -210,48 +256,10 @@ func (a *ibmcloudMethod) CredSuccess() {
 // Shutdown stops the auth method
 func (a *ibmcloudMethod) Shutdown() {
 	close(a.stopCh)
-	close(a.credsFound)
 }
 
-// fetchCRToken retrieves a compute resource token from the metadata service
-func (a *ibmcloudMethod) fetchCRToken() (string, error) {
-	req, err := http.NewRequest("PUT", a.metadataEndpoint+"/instance_identity/v1/token", nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Metadata-Flavor", "ibm")
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch CR token: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to fetch CR token with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read CR token response: %w", err)
-	}
-
-	// The response is a JSON object with an access_token field
-	// For simplicity, we'll parse it manually
-	// In production, use json.Unmarshal
-	token := string(body)
-
-	return token, nil
-}
-
-// pollForCRToken periodically checks for new CR tokens
-func (a *ibmcloudMethod) pollForCRToken() {
+// pollForCredentials periodically checks for new credentials from the metadata service
+func (a *ibmcloudMethod) pollForCredentials() {
 	ticker := time.NewTicker(time.Duration(a.credentialPollInterval) * time.Second)
 	defer ticker.Stop()
 
@@ -261,18 +269,26 @@ func (a *ibmcloudMethod) pollForCRToken() {
 			a.logger.Trace("shutdown triggered, stopping ibmcloud auth handler")
 			return
 		case <-ticker.C:
-			if err := a.checkCRToken(); err != nil {
-				a.logger.Warn("unable to retrieve current CR token, retaining last token", "error", err)
+			if err := a.checkCredentials(); err != nil {
+				a.logger.Warn("unable to retrieve current credentials from metadata service", "error", err)
 			}
 		}
 	}
 }
 
-// checkCRToken checks if a new CR token is available
-func (a *ibmcloudMethod) checkCRToken() error {
-	a.logger.Trace("checking for new CR token")
+// checkCredentials checks if new credentials are available
+func (a *ibmcloudMethod) checkCredentials() error {
+	a.logger.Trace("checking for new credentials from metadata service")
 
-	newToken, err := a.fetchCRToken()
+	iamClient, err := ibmcloud.NewIBMCloudIAMClient(a.iamEndpoint, a.logger)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	resp, err := iamClient.ExchangeVPCMetadata(ctx, a.metadataEndpoint, a.trustedProfileID)
 	if err != nil {
 		return err
 	}
@@ -280,20 +296,14 @@ func (a *ibmcloudMethod) checkCRToken() error {
 	a.credLock.Lock()
 	defer a.credLock.Unlock()
 
-	// If the token has changed, notify that new creds are available
-	if newToken != a.lastCRToken {
-		a.lastCRToken = newToken
-		a.logger.Trace("new CR token detected, triggering Authenticate")
+	if resp.AccessToken != a.lastIAMToken {
+		a.logger.Trace("new IAM token detected from metadata service, triggering Authenticate")
 		select {
 		case a.credsFound <- struct{}{}:
+		case <-a.stopCh:
 		default:
-			// Channel might be full, that's okay
 		}
-	} else {
-		a.logger.Trace("CR token unchanged")
 	}
 
 	return nil
 }
-
-// Made with Bob
