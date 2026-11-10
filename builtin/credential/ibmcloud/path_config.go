@@ -6,8 +6,10 @@ package ibmcloud
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/automatedrotationutil"
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
@@ -17,9 +19,6 @@ const configStoragePath = "config"
 type ibmCloudConfig struct {
 	// IAM endpoint URL
 	IAMEndpoint string `json:"iam_endpoint"`
-
-	// Metadata service endpoint URL
-	MetadataEndpoint string `json:"metadata_endpoint"`
 
 	// IAM client timeout in seconds
 	IAMClientTimeout int `json:"iam_client_timeout"`
@@ -36,10 +35,14 @@ type ibmCloudConfig struct {
 	// IBM Cloud account ID for authentication verification (required when api_key is set)
 	// Used to verify that authenticating users/service IDs belong to this account
 	AccountID string `json:"account_id"`
+
+	// AutomatedRotationParams holds the schedule/period/window/disable fields
+	// for automated root credential rotation.
+	automatedrotationutil.AutomatedRotationParams
 }
 
 func (b *backend) pathConfigIBMCloud() *framework.Path {
-	return &framework.Path{
+	p := &framework.Path{
 		Pattern: "config$",
 
 		DisplayAttrs: &framework.DisplayAttributes{
@@ -52,11 +55,6 @@ func (b *backend) pathConfigIBMCloud() *framework.Path {
 				Type:        framework.TypeString,
 				Description: "IBM Cloud IAM endpoint URL. Defaults to https://iam.cloud.ibm.com",
 				Default:     defaultIAMEndpoint,
-			},
-			"metadata_endpoint": {
-				Type:        framework.TypeString,
-				Description: "VPC metadata service endpoint URL. Defaults to http://169.254.169.254",
-				Default:     defaultMetadataEndpoint,
 			},
 			"iam_client_timeout": {
 				Type:        framework.TypeInt,
@@ -72,7 +70,7 @@ func (b *backend) pathConfigIBMCloud() *framework.Path {
 			},
 			"service_id": {
 				Type:        framework.TypeString,
-				Description: "Service ID that owns the API key. Required when api_key is set.",
+				Description: "Service ID that owns the API key. Optional; only required for root rotation (config/rotate-root).",
 			},
 			"account_id": {
 				Type:        framework.TypeString,
@@ -83,26 +81,66 @@ func (b *backend) pathConfigIBMCloud() *framework.Path {
 		Operations: map[logical.Operation]framework.OperationHandler{
 			logical.ReadOperation: &framework.PathOperation{
 				Callback: b.pathConfigRead,
+				Summary:  "Return the configured IBM Cloud settings.",
 				DisplayAttrs: &framework.DisplayAttributes{
 					OperationVerb: "read",
+				},
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: "OK",
+						Fields: map[string]*framework.FieldSchema{
+							"iam_endpoint": {
+								Type:        framework.TypeString,
+								Description: "IBM Cloud IAM endpoint URL.",
+							},
+							"iam_client_timeout": {
+								Type:        framework.TypeInt,
+								Description: "Timeout for IAM API calls in seconds.",
+							},
+							"service_id": {
+								Type:        framework.TypeString,
+								Description: "Service ID that owns the API key.",
+							},
+							"account_id": {
+								Type:        framework.TypeString,
+								Description: "IBM Cloud account ID for authentication verification.",
+							},
+						},
+					}},
 				},
 			},
 			logical.CreateOperation: &framework.PathOperation{
 				Callback: b.pathConfigWrite,
+				Summary:  "Configure IBM Cloud IAM settings and credentials used for authentication.",
 				DisplayAttrs: &framework.DisplayAttributes{
 					OperationVerb: "configure",
+				},
+				ForwardPerformanceSecondary: true,
+				ForwardPerformanceStandby:   true,
+				Responses: map[int][]framework.Response{
+					http.StatusNoContent: {{Description: "No Content"}},
 				},
 			},
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathConfigWrite,
+				Summary:  "Configure IBM Cloud IAM settings and credentials used for authentication.",
 				DisplayAttrs: &framework.DisplayAttributes{
 					OperationVerb: "configure",
+				},
+				ForwardPerformanceSecondary: true,
+				ForwardPerformanceStandby:   true,
+				Responses: map[int][]framework.Response{
+					http.StatusNoContent: {{Description: "No Content"}},
 				},
 			},
 			logical.DeleteOperation: &framework.PathOperation{
 				Callback: b.pathConfigDelete,
+				Summary:  "Delete the IBM Cloud configuration.",
 				DisplayAttrs: &framework.DisplayAttributes{
 					OperationVerb: "delete",
+				},
+				Responses: map[int][]framework.Response{
+					http.StatusNoContent: {{Description: "No Content"}},
 				},
 			},
 		},
@@ -112,6 +150,8 @@ func (b *backend) pathConfigIBMCloud() *framework.Path {
 		HelpSynopsis:    pathConfigHelpSyn,
 		HelpDescription: pathConfigHelpDesc,
 	}
+	automatedrotationutil.AddAutomatedRotationFields(p.Fields)
+	return p
 }
 
 // pathConfigExistenceCheck checks if configuration exists
@@ -134,16 +174,16 @@ func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, data
 		return nil, nil
 	}
 
-	return &logical.Response{
-		Data: map[string]interface{}{
-			"iam_endpoint":       config.IAMEndpoint,
-			"metadata_endpoint":  config.MetadataEndpoint,
-			"iam_client_timeout": config.IAMClientTimeout,
-			"service_id":         config.ServiceID,
-			"account_id":         config.AccountID,
-			// Never return the API key
-		},
-	}, nil
+	respData := map[string]interface{}{
+		"iam_endpoint":       config.IAMEndpoint,
+		"iam_client_timeout": config.IAMClientTimeout,
+		"service_id":         config.ServiceID,
+		"account_id":         config.AccountID,
+		// Never return the API key
+	}
+	config.AutomatedRotationParams.PopulateSetAutomatedRotationData(respData)
+
+	return &logical.Response{Data: respData}, nil
 }
 
 func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
@@ -159,10 +199,6 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, dat
 	// Update fields if provided
 	if iamEndpoint, ok := data.GetOk("iam_endpoint"); ok {
 		config.IAMEndpoint = iamEndpoint.(string)
-	}
-
-	if metadataEndpoint, ok := data.GetOk("metadata_endpoint"); ok {
-		config.MetadataEndpoint = metadataEndpoint.(string)
 	}
 
 	if iamClientTimeout, ok := data.GetOk("iam_client_timeout"); ok {
@@ -181,14 +217,10 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, dat
 		config.AccountID = accountID.(string)
 	}
 
-	// Validate that if api_key is set, both service_id and account_id must also be set
-	if config.APIKey != "" {
-		if config.ServiceID == "" {
-			return logical.ErrorResponse("service_id is required when api_key is set"), nil
-		}
-		if config.AccountID == "" {
-			return logical.ErrorResponse("account_id is required when api_key is set"), nil
-		}
+	// Validate that if api_key is set, account_id must also be set. service_id
+	// is optional: it is only needed for root rotation, which checks for it.
+	if config.APIKey != "" && config.AccountID == "" {
+		return logical.ErrorResponse("account_id is required when api_key is set"), nil
 	}
 
 	// Validate that if account_id is set, api_key must also be set
@@ -200,20 +232,26 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, dat
 	if config.IAMEndpoint == "" {
 		config.IAMEndpoint = defaultIAMEndpoint
 	}
-	if config.MetadataEndpoint == "" {
-		config.MetadataEndpoint = defaultMetadataEndpoint
-	}
 	if config.IAMClientTimeout == 0 {
 		config.IAMClientTimeout = 30
 	}
 
+	// Handle automated rotation fields. HandleRotationJob calls
+	// ParseAutomatedRotationFields internally and decides whether to
+	// register or deregister based on the parsed values; calling it
+	// unconditionally is correct and avoids a redundant pre-parse.
+	rotationOpResp, err := config.HandleRotationJob(ctx, b.Backend, data, req)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+
 	entry, err := logical.StorageEntryJSON(configStoragePath, config)
 	if err != nil {
-		return nil, err
+		return nil, rotationOpResp.HandleStorageErrorAfterRotationJob(req, err)
 	}
 
 	if err := req.Storage.Put(ctx, entry); err != nil {
-		return nil, err
+		return nil, rotationOpResp.HandleStorageErrorAfterRotationJob(req, err)
 	}
 
 	// Invalidate the cached client
@@ -265,31 +303,36 @@ Configuration Parameters:
   * iam_endpoint (string, optional)
       IBM Cloud IAM endpoint URL. Defaults to https://iam.cloud.ibm.com
 
-  * metadata_endpoint (string, optional)
-      VPC metadata service endpoint URL. Defaults to http://169.254.169.254
-
   * iam_client_timeout (int, optional)
       Timeout for IAM API calls in seconds. Defaults to 30
 
   * api_key (string, optional)
       Admin API key for account verification and root credential rotation.
       Required for proper account and access group verification during authentication.
-      When set, both service_id and account_id must also be provided.
+      When set, account_id must also be provided.
 
   * service_id (string, optional)
-      Service ID that owns the API key. Required when api_key is set.
+      Service ID that owns the API key. Only required for root credential
+      rotation (config/rotate-root); not needed for authentication.
 
   * account_id (string, optional)
-      IBM Cloud account ID for authentication verification. Required when api_key is set.
+      IBM Cloud account ID for authentication verification. Required when api_key is set,
+      and api_key is required when account_id is set.
       Used to verify that authenticating users/service IDs belong to this account.
 
 Example (minimal configuration):
 
   $ vault write auth/ibmcloud/config \
-      iam_endpoint="https://iam.cloud.ibm.com" \
-      metadata_endpoint="http://169.254.169.254"
+      iam_endpoint="https://iam.cloud.ibm.com"
 
 Example (with admin credentials for verification):
+
+  $ vault write auth/ibmcloud/config \
+      iam_endpoint="https://iam.cloud.ibm.com" \
+      api_key="<admin-api-key>" \
+      account_id="abc123def456"
+
+Example (also enabling root rotation):
 
   $ vault write auth/ibmcloud/config \
       iam_endpoint="https://iam.cloud.ibm.com" \

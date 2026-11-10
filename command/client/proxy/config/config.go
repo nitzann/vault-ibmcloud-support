@@ -831,6 +831,7 @@ var autoAuthMethodKeys = map[string][]string{
 	"cert":       {""},
 	"cf":         {""},
 	"gcp":        {"service_account"},
+	"ibmcloud":   {""},
 	"jwt":        {""},
 	"ldap":       {""},
 	"kerberos":   {""},

@@ -5,6 +5,7 @@ package ibmcloud
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/hashicorp/vault/sdk/framework"
@@ -27,28 +28,13 @@ func (b *backend) pathLogin() *framework.Path {
 				Description: "Name of the role to authenticate against",
 				Required:    true,
 			},
-			"type": {
+			"token": {
 				Type:        framework.TypeString,
-				Description: "Type of authentication: 'apikey' or 'trusted_profile'",
+				Description: "IBM Cloud IAM access token (JWT) obtained by the client",
 				Required:    true,
-			},
-			"apikey": {
-				Type:        framework.TypeString,
-				Description: "(API Key type) IBM Cloud API key",
 				DisplayAttrs: &framework.DisplayAttributes{
 					Sensitive: true,
 				},
-			},
-			"cr_token": {
-				Type:        framework.TypeString,
-				Description: "(Trusted Profile type) Compute resource token (auto-fetched if not provided)",
-				DisplayAttrs: &framework.DisplayAttributes{
-					Sensitive: true,
-				},
-			},
-			"trusted_profile_id": {
-				Type:        framework.TypeString,
-				Description: "(Trusted Profile type) Override trusted profile ID",
 			},
 		},
 
@@ -72,14 +58,9 @@ func (b *backend) pathLoginUpdate(ctx context.Context, req *logical.Request, dat
 		return logical.ErrorResponse("missing role"), nil
 	}
 
-	authType := data.Get("type").(string)
-	if authType == "" {
-		return logical.ErrorResponse("missing type"), nil
-	}
-
-	// Validate auth type
-	if authType != roleTypeAPIKey && authType != roleTypeTrustedProfile {
-		return logical.ErrorResponse("type must be 'apikey' or 'trusted_profile'"), nil
+	token := data.Get("token").(string)
+	if token == "" {
+		return logical.ErrorResponse("missing token"), nil
 	}
 
 	// Load the role
@@ -92,36 +73,47 @@ func (b *backend) pathLoginUpdate(ctx context.Context, req *logical.Request, dat
 		return logical.ErrorResponse("role %q not found", roleName), nil
 	}
 
-	// Verify role type matches request type
-	if role.Type != authType {
-		return logical.ErrorResponse("role type %q does not match request type %q", role.Type, authType), nil
-	}
-
 	// Get IAM client
 	client, err := b.getIAMClient(ctx, req.Storage)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get IAM client: %w", err)
 	}
 
-	// Authenticate based on type
-	var identity *IdentityInfo
-	switch authType {
-	case roleTypeAPIKey:
-		identity, err = b.authenticateAPIKey(ctx, client, data)
-	case roleTypeTrustedProfile:
-		identity, err = b.authenticateTrustedProfile(ctx, client, data, role)
-	default:
-		return logical.ErrorResponse("invalid authentication type"), nil
+	// Verify the token offline (JWKS) and online (introspect)
+	//
+	// IBM IAM tokens carry no Vault-specific audience, so the account ID and
+	// role binding checks below are the primary guard against token reuse.
+	identity, err := client.VerifyToken(ctx, token)
+	if err != nil {
+		if errors.Is(err, errInvalidToken) {
+			return logical.ErrorResponse("token verification failed: %s", err.Error()), nil
+		}
+		return nil, fmt.Errorf("token verification failed: %w", err)
 	}
 
+	// Derive the identity kind from the token and compare it to the role type
+	authType, err := roleTypeForSubjectType(identity.SubjectType)
 	if err != nil {
-		return nil, fmt.Errorf("authentication failed: %w", err)
+		return logical.ErrorResponse("%s", err.Error()), nil
+	}
+	if role.Type != authType {
+		return logical.ErrorResponse("role type %q does not match token identity type %q", role.Type, authType), nil
 	}
 
 	// Load config for account verification
 	config, err := b.config(ctx, req.Storage)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// IAM tokens carry no Vault-specific audience, so when an account is
+	// configured every identity type must belong to it. Trusted profile
+	// identities are checked against the introspected account only; the
+	// admin-token lookups below apply to user and service ID identities.
+	if authType == roleTypeTrustedProfile && config != nil && config.AccountID != "" {
+		if identity.AccountID != config.AccountID {
+			return logical.ErrorResponse("account verification failed: identity account %s does not match configured account %s", identity.AccountID, config.AccountID), nil
+		}
 	}
 
 	// Perform dual-token verification for API key authentication
@@ -139,14 +131,7 @@ func (b *backend) pathLoginUpdate(ctx context.Context, req *logical.Request, dat
 
 		// Verify access group membership using user token if required
 		if len(role.BoundAccessGroupIDs) > 0 {
-			// Get user token from the authentication we just performed
-			userAPIKey := data.Get("apikey").(string)
-			userTokenResp, err := client.AuthenticateWithAPIKey(ctx, userAPIKey)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get user token for group verification: %w", err)
-			}
-
-			isMember, err := client.CheckAccessGroupMembership(ctx, userTokenResp.AccessToken, identity.IAMID, identity.AccountID, role.BoundAccessGroupIDs)
+			isMember, err := client.CheckAccessGroupMembership(ctx, token, identity.IAMID, identity.AccountID, role.BoundAccessGroupIDs)
 			if err != nil {
 				return nil, fmt.Errorf("failed to check access group membership: %w", err)
 			}
@@ -209,70 +194,16 @@ func (b *backend) pathLoginUpdate(ctx context.Context, req *logical.Request, dat
 	}, nil
 }
 
-func (b *backend) authenticateAPIKey(ctx context.Context, client *IBMCloudIAMClient, data *framework.FieldData) (*IdentityInfo, error) {
-	apiKey := data.Get("apikey").(string)
-	if apiKey == "" {
-		return nil, fmt.Errorf("missing apikey")
+// roleTypeForSubjectType maps the IAM introspect sub_type claim to a role type.
+func roleTypeForSubjectType(subType string) (string, error) {
+	switch subType {
+	case "User", "ServiceId":
+		return roleTypeAPIKey, nil
+	case "Profile":
+		return roleTypeTrustedProfile, nil
+	default:
+		return "", fmt.Errorf("unsupported token subject type %q", subType)
 	}
-
-	b.Logger().Debug("authenticating with API key", "apikey_prefix", apiKey[:min(10, len(apiKey))]+"...")
-
-	// Exchange API key for IAM token
-	tokenResp, err := client.AuthenticateWithAPIKey(ctx, apiKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to authenticate with API key: %w", err)
-	}
-
-	b.Logger().Debug("successfully obtained IAM token", "token_type", tokenResp.TokenType, "expires_in", tokenResp.ExpiresIn)
-
-	// Validate token and get identity information
-	identity, err := client.ValidateToken(ctx, tokenResp.AccessToken)
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate token: %w", err)
-	}
-
-	b.Logger().Debug("token validated successfully",
-		"iam_id", identity.IAMID,
-		"subject", identity.Subject,
-		"subject_type", identity.SubjectType,
-		"identifier", identity.Identifier,
-		"account_id", identity.AccountID,
-		"account_bss", identity.Account.BSS)
-
-	return identity, nil
-}
-
-func (b *backend) authenticateTrustedProfile(ctx context.Context, client *IBMCloudIAMClient, data *framework.FieldData, role *ibmCloudRole) (*IdentityInfo, error) {
-	crToken := data.Get("cr_token").(string)
-	trustedProfileID := data.Get("trusted_profile_id").(string)
-
-	// IAM requires a profile_id for the CR token exchange; default to the role's bound profile
-	if trustedProfileID == "" {
-		trustedProfileID = role.BoundTrustedProfileID
-	}
-
-	// If CR token not provided, fetch from metadata service
-	if crToken == "" {
-		var err error
-		crToken, err = client.FetchCRToken(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch CR token from metadata service: %w", err)
-		}
-	}
-
-	// Exchange CR token for IAM token
-	tokenResp, err := client.AuthenticateWithCRToken(ctx, crToken, trustedProfileID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to authenticate with CR token: %w", err)
-	}
-
-	// Validate token and get identity information
-	identity, err := client.ValidateToken(ctx, tokenResp.AccessToken)
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate token: %w", err)
-	}
-
-	return identity, nil
 }
 
 func (b *backend) pathLoginRenew(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
@@ -311,44 +242,34 @@ func (b *backend) pathLoginRenew(ctx context.Context, req *logical.Request, data
 }
 
 const pathLoginHelpSyn = `
-Authenticate to Vault using IBM Cloud IAM credentials.
+Authenticate to Vault using an IBM Cloud IAM access token.
 `
 
 const pathLoginHelpDesc = `
-This endpoint allows authentication using IBM Cloud IAM credentials.
+This endpoint authenticates using an IBM Cloud IAM access token (JWT) that the
+client has already obtained from IBM Cloud IAM. Vault never receives API keys
+or compute resource tokens. The vault CLI handler and the Vault Agent perform
+the credential exchange locally.
 
-Two authentication types are supported:
-
-1. API Key Authentication:
-   Authenticate using an IBM Cloud API key (user or service ID).
-
-   Example:
-     $ vault write auth/ibmcloud/login \
-         role=my-role \
-         type=apikey \
-         apikey="your-api-key"
-
-2. Trusted Profile Authentication:
-   Authenticate using a compute resource token from a VPC instance.
-   The CR token can be provided explicitly or auto-fetched from the
-   metadata service.
-
-   Example (auto-fetch):
-     $ vault write auth/ibmcloud/login \
-         role=my-role \
-         type=trusted_profile
-
-   Example (explicit token):
-     $ vault write auth/ibmcloud/login \
-         role=my-role \
-         type=trusted_profile \
-         cr_token="your-cr-token"
+Example:
+  $ vault write auth/ibmcloud/login \
+      role=my-role \
+      token="<iam-access-token>"
 
 The authentication process:
-1. Validates the provided credentials with IBM Cloud IAM
-2. Extracts identity information from the IAM token
-3. Validates the identity against the role's binding requirements
-4. Issues a Vault token with the configured policies and properties
+1. Verifies the token offline against the IAM JWKS (RS256 signature, issuer,
+   exp and nbf). The key is selected by the token's kid header.
+2. Confirms with IAM introspect that the token is active and reads the identity
+   claims.
+3. Derives the identity kind from the sub_type claim (User and ServiceId map to
+   role type apikey, Profile maps to role type trusted_profile) and requires it
+   to match the role's type.
+4. Validates the identity against the role's binding requirements.
+5. Issues a Vault token with the configured policies and properties.
+
+The IAM access token is a bearer token valid for up to about 60 minutes. IBM
+IAM tokens carry no Vault-specific audience, so the account ID and role binding
+checks are the primary guard.
 `
 
 // verifyAccountMembership verifies that the identity belongs to the configured account

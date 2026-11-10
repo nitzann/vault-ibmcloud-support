@@ -239,6 +239,15 @@ func Test_LoadConfigFile_AutoAuth_AddrConformance(t *testing.T) {
 				"service_account": "https://[2001:db8:ac3:fe4::1]",
 			},
 		},
+		"ibmcloud": {
+			Type:      "ibmcloud",
+			MountPath: "auth/ibmcloud",
+			Namespace: "ibmcloud-namespace/",
+			Config: map[string]any{
+				"role": "foobar",
+				"type": "apikey",
+			},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
